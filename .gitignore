@@ -1,0 +1,13 @@
+# Ignore the Python virtual environment
+rag_env/
+__pycache__/
+
+# Ignore the vector database
+db/
+
+# Ignore your uploaded documents and extracted images
+docs/
+extracted_images/
+
+# Ignore environment variables
+.env
