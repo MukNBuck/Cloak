@@ -52,14 +52,13 @@ chunks = [
 # Models
 # ---------------------------------------------------------------------------
 llm = ChatOllama(
-    model="qwen2.5vl:7b",
+    model="llava",
     temperature=0.0,
-    num_gpu=99,
-    num_ctx=16384,
-    num_predict=200,
+    num_ctx=2048,
+    num_predict=1024,
 )
 
-reranker = CrossEncoder("BAAI/bge-reranker-v2-m3")
+reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
 
 # ---------------------------------------------------------------------------
 # Hybrid retriever
@@ -79,9 +78,11 @@ else:
     hybrid_retriever = vector_retriever
 
 chat_history = []
-
+ 
 class QueryVariations(BaseModel):
     queries: list[str] = Field(
+        min_length=3,
+	max_length=3,
         description="A list of 3 standalone search queries based on the conversation"
     )
 
@@ -94,11 +95,19 @@ def create_query_variations(original_query: str, llm) -> list[str]:
 
     llm_queries = llm.with_structured_output(QueryVariations, method="json_schema")
     query_variations = llm_queries.invoke(prompt)
-    for i, variation in enumerate(query_variations.queries, 1):
+    
+
+    if isinstance(query_variations, dict):
+      variations = result.get("queries", [])
+    else:
+      variations = getattr(query_variations, "queries", [])
+    
+    variations = variations[:3]
+    for i, variation in enumerate(variations, 1):
         print(f"{i}. {variation}")
 
     print("Generated Query variations")
-    return query_variations.queries
+    return variations
 
 def reciprocal_rank_fusion(chunk_lists, k=60, verbose=False):
     if verbose:
@@ -210,6 +219,11 @@ def ask_question(query):
     {combined_docs}
 
     Question: {query}
+
+    Instructions:
+    Think step-by-step about the context to identify the correct figures and resolve any conflicting numbers. Write your thought process inside <reasoning> tags. 
+    After you have completed your reasoning, write your final answer inside <final_answer> tags. Do not use numbered lists.
+
     Answer:"""
 
     response = llm.invoke(prompt)

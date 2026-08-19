@@ -1,8 +1,14 @@
 import os
 import base64
+from dotenv import load_dotenv
 from unstructured.partition.pdf import partition_pdf
 from langchain_core.documents import Document
 from langchain_ollama import ChatOllama
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
+
+load_dotenv()
 
 def get_image_base64(image_path):
     """Convert an image to base64 so Ollama can read it."""
@@ -14,7 +20,7 @@ def summarize_image_with_ollama(image_path):
     print(f"Sending {os.path.basename(image_path)} to qwen2.5vl:7b for visual parsing...")
     
     # Initialize your specific vision model
-    vision_llm = ChatOllama(model="qwen2.5vl:7b", temperature=0.0)
+    vision_llm = ChatOllama(model="llava", temperature=0.0)
     
     image_b64 = get_image_base64(image_path)
     
@@ -35,6 +41,7 @@ def summarize_image_with_ollama(image_path):
 def load_documents_with_vision(docs_path="docs", output_image_dir="extracted_images"):
     """Extract text AND images, summarize images, and combine into documents."""
     print(f"Loading and partitioning PDFs from {docs_path}...")
+    os.makedirs(docs_path, exist_ok=True)
     os.makedirs(output_image_dir, exist_ok=True)
     
     all_documents = []
@@ -49,13 +56,13 @@ def load_documents_with_vision(docs_path="docs", output_image_dir="extracted_ima
         # 1. Partition the PDF (Extract text blocks and save images)
         raw_pdf_elements = partition_pdf(
             filename=file_path,
-            extract_images_in_pdf=True,
+            strategy="fast",                     # Bypasses the missing engine crash
+            extract_images_in_pdf=True,          # Keeps text parsing incredibly swift
             infer_table_structure=True,
             chunking_strategy="by_title",
             max_characters=4000,
             new_after_n_chars=3800,
             combine_text_under_n_chars=2000,
-            extract_image_block_output_dir=output_image_dir,
         )
         
         # 2. Process Text Chunks
@@ -81,8 +88,63 @@ def load_documents_with_vision(docs_path="docs", output_image_dir="extracted_ima
                     metadata={"source": filename, "type": "image", "image_path": img_path}
                 )
                 all_documents.append(img_doc)
-                
-                # Optional: Delete the image after processing to save space, or keep it to return in the UI
-                # os.remove(img_path) 
 
     return all_documents
+
+def split_documents(documents, chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]):
+    print(f"Splitting documents into chunks of size {chunk_size} with overlap {chunk_overlap}...")
+    
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=separators
+    )
+
+    chunks = text_splitter.split_documents(documents)
+
+    if chunks:
+        for i, chunk in enumerate(chunks[:2]):
+            print(f"\nChunk {i+1}:")
+            print(f"Source: {chunk.metadata.get('source', 'Unknown')}")
+            print(f"Length: {len(chunk.page_content)} characters")
+            print(f"Content:\n{chunk.page_content[:200]}...\n" + "-" * 50)
+
+    return chunks
+
+def create_vector_store(chunks, persist_directory="db/chroma_db"):
+    print("Creating embeddings and storing in ChromaDB...")
+
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-small-en-v1.5",
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True}
+    )
+
+    print("Creating ChromaDB vector store...")
+    vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embedding_model,
+        persist_directory=persist_directory,
+        collection_name="rag_collection",
+        collection_metadata={"hnsw:space": "cosine"}
+    )
+    print(f"Finished creating ChromaDB vector store. Persisted at: {persist_directory}")
+
+    return vectorstore
+
+def get_existing_vectorstore():
+    from langchain_huggingface import HuggingFaceEmbeddings
+    from langchain_chroma import Chroma
+
+    # Explicitly initialize the embedding model inside this function
+    embedding_model = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-small-en-v1.5", 
+        model_kwargs={"device": "cpu"},
+        encode_kwargs={"normalize_embeddings": True}
+    )
+    
+    return Chroma(
+        persist_directory="db/chroma_db", 
+        embedding_function=embedding_model,
+        collection_name="rag_collection"
+    )
