@@ -34,14 +34,18 @@ class SessionState:
             search_type="similarity",
             search_kwargs={"k": 8},
         )
-        if self.chunks:
-            bm25_retriever = BM25Retriever.from_documents(self.chunks)
-            bm25_retriever.k = 8
-            self.hybrid_retriever = EnsembleRetriever(
-                retrievers=[bm25_retriever, vector_retriever]
-            )
-        else:
-            self.hybrid_retriever = vector_retriever
+        usable = [chunk for chunk in self.chunks if (chunk.page_content or "").strip()]
+        if usable:
+            try:
+                bm25_retriever = BM25Retriever.from_documents(usable)
+                bm25_retriever.k = 8
+                self.hybrid_retriever = EnsembleRetriever(
+                    retrievers=[bm25_retriever, vector_retriever]
+                )
+                return
+            except Exception as exc:
+                print(f"BM25 rebuild failed, using vector search only: {exc}")
+        self.hybrid_retriever = vector_retriever
 
     def destroy(self):
         self.chunks = []

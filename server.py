@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -13,7 +14,6 @@ from ingestion_pipeline import (
     add_chunks_to_vectorstore,
     collection_has_hash,
     embedding_pack_is_valid,
-    export_embedding_pack,
     import_embedding_pack,
     load_documents_with_vision,
     split_documents,
@@ -129,12 +129,11 @@ async def upload_pdf(
                 content_hash=content_hash,
             )
             chunks = split_documents(documents)
-            add_chunks_to_vectorstore(session.vectorstore, chunks, content_hash)
+            _, embedding_pack = add_chunks_to_vectorstore(
+                session.vectorstore, chunks, content_hash, filename=original_name
+            )
             session.chunks.extend(chunks)
             session.rebuild_retrievers()
-            embedding_pack = export_embedding_pack(
-                session.vectorstore, content_hash, original_name
-            )
             return {
                 "status": "success",
                 "message": f"{original_name} ingested successfully.",
@@ -145,6 +144,7 @@ async def upload_pdf(
         except HTTPException:
             raise
         except Exception as e:
+            traceback.print_exc()
             raise HTTPException(status_code=500, detail=str(e)) from e
 
 

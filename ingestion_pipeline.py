@@ -1,4 +1,5 @@
 import os
+import math
 import base64
 from functools import lru_cache
 
@@ -156,25 +157,73 @@ def split_documents(documents, chunk_size=1000, chunk_overlap=200, separators=["
     return chunks
 
 
-def add_chunks_to_vectorstore(vectorstore, chunks, content_hash):
-    """Embed chunks into an existing ephemeral Chroma collection."""
+def _as_json_float(value):
+    number = float(value)
+    if math.isnan(number) or math.isinf(number):
+        return 0.0
+    return number
+
+
+def _chroma_field(data, key, default=None):
+    if isinstance(data, dict):
+        value = data.get(key, default)
+    else:
+        value = getattr(data, key, default)
+    return default if value is None else value
+
+
+def add_chunks_to_vectorstore(vectorstore, chunks, content_hash, filename="document.pdf"):
+    """Embed chunks into an existing ephemeral Chroma collection and return a client pack."""
     if not chunks:
-        return []
+        return [], {
+            "version": EMBEDDING_PACK_VERSION,
+            "model": EMBEDDING_MODEL_NAME,
+            "content_hash": content_hash,
+            "filename": filename,
+            "chunks": [],
+        }
 
     ids = [f"{content_hash}-{i}" for i in range(len(chunks))]
+    texts = []
+    metadatas = []
     for chunk in chunks:
         chunk.metadata = _clean_metadata(chunk.metadata)
         chunk.metadata["content_hash"] = content_hash
+        texts.append(chunk.page_content)
+        metadatas.append(chunk.metadata)
 
     print("Creating embeddings and storing in session ChromaDB...")
-    vectorstore.add_documents(documents=chunks, ids=ids)
+    raw_embeddings = get_embedding_model().embed_documents(texts)
+    embeddings = [[_as_json_float(value) for value in row] for row in raw_embeddings]
+    vectorstore._collection.add(
+        ids=ids,
+        embeddings=embeddings,
+        documents=texts,
+        metadatas=metadatas,
+    )
     print(f"Finished embedding {len(chunks)} chunks for {content_hash[:12]}...")
-    return ids
+    pack = {
+        "version": EMBEDDING_PACK_VERSION,
+        "model": EMBEDDING_MODEL_NAME,
+        "content_hash": content_hash,
+        "filename": filename,
+        "chunks": [
+            {
+                "id": ids[i],
+                "text": texts[i],
+                "embedding": embeddings[i],
+                "metadata": metadatas[i],
+            }
+            for i in range(len(ids))
+        ],
+    }
+    return ids, pack
 
 
 def collection_has_hash(vectorstore, content_hash):
     existing = vectorstore.get(where={"content_hash": content_hash})
-    return len(existing.get("ids") or []) > 0
+    ids = _chroma_field(existing, "ids", []) or []
+    return len(ids) > 0
 
 
 def embedding_pack_is_valid(pack, content_hash):
@@ -235,7 +284,7 @@ def _embedding_to_list(embedding):
         return []
     if hasattr(embedding, "tolist"):
         embedding = embedding.tolist()
-    return [float(x) for x in embedding]
+    return [_as_json_float(x) for x in embedding]
 
 
 def export_embedding_pack(vectorstore, content_hash, filename):
@@ -246,10 +295,10 @@ def export_embedding_pack(vectorstore, content_hash, filename):
     )
 
     chunks = []
-    ids = data.get("ids") or []
-    embeddings = data.get("embeddings") or []
-    documents = data.get("documents") or []
-    metadatas = data.get("metadatas") or []
+    ids = list(_chroma_field(data, "ids", []) or [])
+    embeddings = list(_chroma_field(data, "embeddings", []) or [])
+    documents = list(_chroma_field(data, "documents", []) or [])
+    metadatas = list(_chroma_field(data, "metadatas", []) or [])
 
     for i, chunk_id in enumerate(ids):
         chunks.append(
