@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from langchain_classic.retrievers import EnsembleRetriever
 from langchain_community.retrievers import BM25Retriever
 
-from ingestion_pipeline import create_ephemeral_vectorstore
+from ingestion_pipeline import create_ephemeral_vectorstore, load_chunks_from_vectorstore
 
 IDLE_SECONDS = 30 * 60
 SWEEP_INTERVAL_SECONDS = 60
@@ -17,8 +17,10 @@ class SessionState:
     def __init__(self, session_id):
         self.session_id = session_id
         self.temp_dir = tempfile.mkdtemp(prefix=f"cloak_{session_id[:8]}_")
+        collection_name = "s" + session_id.replace("-", "")[:32]
+        self.collection_name = collection_name
         self.vectorstore, self._chroma_client = create_ephemeral_vectorstore(
-            collection_name="rag_collection"
+            collection_name=collection_name
         )
         self.chunks = []
         self.chat_history = []
@@ -32,15 +34,16 @@ class SessionState:
     def rebuild_retrievers(self):
         vector_retriever = self.vectorstore.as_retriever(
             search_type="similarity",
-            search_kwargs={"k": 8},
+            search_kwargs={"k": 16},
         )
         usable = [chunk for chunk in self.chunks if (chunk.page_content or "").strip()]
         if usable:
             try:
                 bm25_retriever = BM25Retriever.from_documents(usable)
-                bm25_retriever.k = 8
+                bm25_retriever.k = 16
                 self.hybrid_retriever = EnsembleRetriever(
-                    retrievers=[bm25_retriever, vector_retriever]
+                    retrievers=[bm25_retriever, vector_retriever],
+                    weights=[0.7, 0.3],
                 )
                 return
             except Exception as exc:
@@ -48,6 +51,11 @@ class SessionState:
         self.hybrid_retriever = vector_retriever
 
     def destroy(self):
+        try:
+            if self._chroma_client is not None:
+                self._chroma_client.delete_collection(self.collection_name)
+        except Exception:
+            pass
         self.chunks = []
         self.chat_history = []
         self.hybrid_retriever = None

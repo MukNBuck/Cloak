@@ -15,6 +15,7 @@ from ingestion_pipeline import (
     collection_has_hash,
     embedding_pack_is_valid,
     import_embedding_pack,
+    load_chunks_from_vectorstore,
     load_documents_with_vision,
     split_documents,
 )
@@ -93,13 +94,30 @@ async def upload_pdf(
     file_path, content_hash = await _save_pdf(file, os.path.join(session.temp_dir, "docs"))
 
     with session_manager.session_scope(session_id) as session:
-        if collection_has_hash(session.vectorstore, content_hash):
-            print(f"Skipping {original_name}: already in session.")
+        already_loaded = any(
+            (chunk.metadata or {}).get("content_hash") == content_hash
+            for chunk in session.chunks
+        )
+        if already_loaded:
+            print(f"Skipping {original_name}: already in session chunks.")
             return {
                 "status": "skipped",
                 "message": f"'{original_name}' is already loaded in this session.",
                 "content_hash": content_hash,
             }
+
+        if collection_has_hash(session.vectorstore, content_hash):
+            loaded = load_chunks_from_vectorstore(session.vectorstore, content_hash)
+            if loaded:
+                session.chunks.extend(loaded)
+                session.rebuild_retrievers()
+                print(f"Hydrated {len(loaded)} chunks for {original_name} from session store.")
+                return {
+                    "status": "restored",
+                    "message": f"'{original_name}' restored from session store.",
+                    "chunks_created": len(loaded),
+                    "content_hash": content_hash,
+                }
 
         print(f"\n--- NEW FILE UPLOADED: {original_name} ({content_hash[:12]}...) ---")
 

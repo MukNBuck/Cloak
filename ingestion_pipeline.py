@@ -18,7 +18,7 @@ load_dotenv()
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_PACK_VERSION = 1
-EXPORTABLE_METADATA_KEYS = ("source", "type", "content_hash")
+EXPORTABLE_METADATA_KEYS = ("source", "type", "content_hash", "page")
 
 
 def get_image_base64(image_path):
@@ -62,6 +62,10 @@ def get_embedding_model():
 
 def create_ephemeral_vectorstore(collection_name="rag_collection"):
     client = chromadb.EphemeralClient()
+    try:
+        client.delete_collection(collection_name)
+    except Exception:
+        pass
     return Chroma(
         client=client,
         collection_name=collection_name,
@@ -253,6 +257,8 @@ def _table_documents(tables, source_filename, content_hash, max_rows=12):
             }
             if content_hash:
                 metadata["content_hash"] = content_hash
+            if table.get("page"):
+                metadata["page"] = int(table["page"])
             documents.append(
                 Document(
                     page_content=verbalize_table(
@@ -284,8 +290,15 @@ def load_documents_with_vision(file_path, output_image_dir, source_filename=None
 
     for element in raw_pdf_elements:
         if "CompositeElement" in str(type(element)):
+            meta = dict(base_metadata)
+            page = getattr(getattr(element, "metadata", None), "page_number", None)
+            if page is not None:
+                try:
+                    meta["page"] = int(page)
+                except (TypeError, ValueError):
+                    pass
             all_documents.append(
-                Document(page_content=element.text, metadata=dict(base_metadata))
+                Document(page_content=element.text, metadata=meta)
             )
 
     plumber_tables = _extract_tables_pdfplumber(file_path)
@@ -406,6 +419,20 @@ def collection_has_hash(vectorstore, content_hash):
     existing = vectorstore.get(where={"content_hash": content_hash})
     ids = _chroma_field(existing, "ids", []) or []
     return len(ids) > 0
+
+
+def load_chunks_from_vectorstore(vectorstore, content_hash=None):
+    kwargs = {"include": ["documents", "metadatas"]}
+    if content_hash:
+        kwargs["where"] = {"content_hash": content_hash}
+    data = vectorstore.get(**kwargs)
+    documents = list(_chroma_field(data, "documents", []) or [])
+    metadatas = list(_chroma_field(data, "metadatas", []) or [])
+    chunks = []
+    for index, text in enumerate(documents):
+        metadata = metadatas[index] if index < len(metadatas) else {}
+        chunks.append(Document(page_content=text or "", metadata=_clean_metadata(metadata)))
+    return chunks
 
 
 def embedding_pack_is_valid(pack, content_hash):

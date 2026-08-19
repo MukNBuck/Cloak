@@ -18,6 +18,8 @@ from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field
 from sentence_transformers import CrossEncoder
 
+from ingestion_pipeline import load_chunks_from_vectorstore
+
 load_dotenv()
 
 llm = ChatOllama(
@@ -32,18 +34,27 @@ reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
 
 class QueryVariations(BaseModel):
     queries: list[str] = Field(
-        min_length=3,
-        max_length=3,
-        description="A list of 3 standalone search queries based on the conversation",
+        min_length=2,
+        max_length=2,
+        description="Two search queries that keep the original technical terms",
     )
 
 
+SPEC_HINTS = (
+    "dbm", "ma", "gpio", "pin", "sensitivity", "touch", "capacitive",
+    "mhz", "voltage", "current", "table", "mapping", "restriction",
+)
+
+
 def create_query_variations(original_query: str, llm) -> list[str]:
-    prompt = f"""Generate 3 different variations of the query that would help retrieve relevant documents:
+    prompt = f"""Generate 2 alternative search queries for a hardware datasheet.
 
     Original query: {original_query}
 
-    Return 3 alternative queries that rephrase or approach the same question from different angles."""
+    Rules:
+    Keep exact technical terms, units, and metric names from the original (for example: sensitivity, dBm, capacitive touch, GPIO).
+    Do not replace a requested metric with a related one (do not change sensitivity into current consumption, or touch into CAP/SENSOR).
+    Only rephrase around those preserved terms."""
 
     llm_queries = llm.with_structured_output(QueryVariations, method="json_schema")
     query_variations = llm_queries.invoke(prompt)
@@ -53,7 +64,7 @@ def create_query_variations(original_query: str, llm) -> list[str]:
     else:
         variations = getattr(query_variations, "queries", [])
 
-    variations = variations[:3]
+    variations = variations[:2]
     for i, variation in enumerate(variations, 1):
         print(f"{i}. {variation}")
 
@@ -61,7 +72,7 @@ def create_query_variations(original_query: str, llm) -> list[str]:
     return variations
 
 
-def reciprocal_rank_fusion(chunk_lists, k=60, verbose=False):
+def reciprocal_rank_fusion(chunk_lists, k=60, query_weights=None, verbose=False):
     if verbose:
         print("\n" + "=" * 60)
         print("APPLYING RRF")
@@ -75,6 +86,9 @@ def reciprocal_rank_fusion(chunk_lists, k=60, verbose=False):
     for query_idx, result_chunks in enumerate(chunk_lists, 1):
         if verbose:
             print(f"Proccessing Query {query_idx} results:")
+        weight = 1.0
+        if query_weights and query_idx - 1 < len(query_weights):
+            weight = query_weights[query_idx - 1]
 
         for position, chunk in enumerate(result_chunks, 1):
             chunk_content = chunk.page_content
@@ -85,7 +99,7 @@ def reciprocal_rank_fusion(chunk_lists, k=60, verbose=False):
 
             chunk_id = chunk_id_map[chunk_content]
             all_unique_chunks[chunk_content] = chunk
-            position_score = 1 / (k + position)
+            position_score = weight / (k + position)
             rrf_scores[chunk_content] += position_score
 
             if verbose:
@@ -136,11 +150,16 @@ def extract_display_answer(raw_text: str) -> str:
 def ask_question(query, session):
     chat_history = session.chat_history
 
+    if not session.chunks and session.vectorstore is not None:
+        session.chunks = load_chunks_from_vectorstore(session.vectorstore)
+        session.rebuild_retrievers()
+
+    print(f"Session has {len(session.chunks)} chunks")
     if not session.chunks or session.hybrid_retriever is None:
         answer = "I don't know"
         chat_history.append(HumanMessage(content=query))
         chat_history.append(AIMessage(content=answer))
-        return {"answer": answer, "context": []}
+        return {"answer": answer, "context": [], "citations": []}
 
     if chat_history:
         messages = [
@@ -159,6 +178,7 @@ def ask_question(query, session):
 
     all_retrieval_results = []
     query_variations = [search_question] + create_query_variations(search_question, llm)
+    query_weights = [2.0] + [1.0] * (len(query_variations) - 1)
 
     for i, variation in enumerate(query_variations, 1):
         print(f"RESULTS FOR QUERY {i}: {variation}")
@@ -166,7 +186,9 @@ def ask_question(query, session):
         all_retrieval_results.append(docs)
 
     print(f"\nFusing {len(all_retrieval_results)} query result lists with RRF...")
-    fused_docs = reciprocal_rank_fusion(all_retrieval_results, k=60)
+    fused_docs = reciprocal_rank_fusion(
+        all_retrieval_results, k=60, query_weights=query_weights
+    )
     print(f"RRF produced {len(fused_docs)} unique candidates")
 
     if not fused_docs:
@@ -177,11 +199,19 @@ def ask_question(query, session):
         return {"answer": answer, "context": []}
 
     print("Reranking fused candidates with cross-encoder...")
-    pairs = [[search_question, doc.page_content] for doc in fused_docs]
+    rerank_docs = fused_docs[:24]
+    pairs = [[search_question, doc.page_content] for doc in rerank_docs]
     scores = reranker.predict(pairs)
-    scored_docs = sorted(zip(scores, fused_docs), key=lambda x: x[0], reverse=True)
+    boost_tables = any(hint in search_question.lower() for hint in SPEC_HINTS)
+    scored_docs = []
+    for score, doc in zip(scores, rerank_docs):
+        adjusted = float(score)
+        if boost_tables and doc.metadata.get("type") == "table":
+            adjusted += 1.0
+        scored_docs.append((adjusted, doc))
+    scored_docs.sort(key=lambda item: item[0], reverse=True)
 
-    top_docs = [doc for score, doc in scored_docs[:3]]
+    top_docs = [doc for score, doc in scored_docs[:5]]
 
     combined_docs = "\n\n".join(get_answer_context(doc) for doc in top_docs)
 
@@ -194,6 +224,8 @@ def ask_question(query, session):
 
     Instructions:
     Tables are written as sentences like "Row: Header is value". Treat each Row as one complete record; do not mix values across rows.
+    Rely on explicit tables and lists before inferring answers from partial acronyms or variable names. CAP in SENSOR_CAPP is not capacitive touch.
+    If the context has a related metric but not the asked quantity or unit (for example mA when the question asks for dBm), respond with "I don't know".
     Reply with a short direct answer only. Put it inside <final_answer> tags. Do not write reasoning, lists, or extra commentary.
 
     Answer:"""
@@ -206,7 +238,28 @@ def ask_question(query, session):
 
     print(f"Answer: {display_answer}")
 
+    citations = []
+    for index, doc in enumerate(top_docs, 1):
+        meta = doc.metadata or {}
+        page = meta.get("page")
+        try:
+            page = int(page) if page is not None else None
+        except (TypeError, ValueError):
+            page = None
+        citations.append(
+            {
+                "id": index,
+                "source": meta.get("source") or "document.pdf",
+                "content_hash": meta.get("content_hash") or "",
+                "type": meta.get("type") or "text",
+                "page": page,
+                "excerpt": get_answer_context(doc),
+            }
+        )
+
     return {
         "answer": display_answer,
-        "context": [get_answer_context(doc) for doc in top_docs],
+        "context": [item["excerpt"] for item in citations],
+        "citations": citations,
     }
+ 
