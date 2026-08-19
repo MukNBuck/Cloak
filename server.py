@@ -1,58 +1,161 @@
+import hashlib
+import json
 import os
-import shutil
-from fastapi import FastAPI, UploadFile, File, HTTPException
+import uuid
+from contextlib import asynccontextmanager
+from typing import Optional
+
+from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from pydantic import BaseModel
-# UPDATED: Importing the vision-specific function
-from ingestion_pipeline import load_documents_with_vision, split_documents, create_vector_store, get_existing_vectorstore
+
 from history_aware_generation import ask_question
+from ingestion_pipeline import (
+    add_chunks_to_vectorstore,
+    collection_has_hash,
+    embedding_pack_is_valid,
+    export_embedding_pack,
+    import_embedding_pack,
+    load_documents_with_vision,
+    split_documents,
+)
+from session_manager import session_manager
 
-app = FastAPI(title="Local RAG Backend API")
 
-os.makedirs("docs", exist_ok=True)
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    session_manager.start_sweeper()
+    yield
+    session_manager.shutdown()
+
+
+app = FastAPI(title="Local RAG Backend API", lifespan=lifespan)
+
 
 class QueryRequest(BaseModel):
     query: str
 
+
+def _require_session_id(x_session_id: Optional[str]) -> str:
+    if not x_session_id or not x_session_id.strip():
+        raise HTTPException(status_code=400, detail="X-Session-Id header is required.")
+    return x_session_id.strip()
+
+
+async def _read_embedding_pack(embeddings: Optional[UploadFile]):
+    if embeddings is None:
+        return None
+    raw = await embeddings.read()
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid embeddings JSON: {exc}") from exc
+
+
+async def _save_pdf(file: UploadFile, dest_dir: str) -> tuple:
+    os.makedirs(dest_dir, exist_ok=True)
+    incoming_path = os.path.join(dest_dir, f"incoming-{uuid.uuid4().hex}.pdf")
+    hasher = hashlib.sha256()
+    with open(incoming_path, "wb") as buffer:
+        while True:
+            chunk = await file.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+            buffer.write(chunk)
+    content_hash = hasher.hexdigest()
+    final_path = os.path.join(dest_dir, f"{content_hash}.pdf")
+    os.replace(incoming_path, final_path)
+    return final_path, content_hash
+
+
+@app.post("/session/close")
+async def close_session(x_session_id: Optional[str] = Header(default=None)):
+    session_id = _require_session_id(x_session_id)
+    closed = session_manager.close(session_id)
+    return {"status": "closed" if closed else "already_closed", "session_id": session_id}
+
+
 @app.post("/upload_pdf")
-async def upload_pdf(file: UploadFile = File(...)):
-    
-    # 1. Get the DB connection cleanly from your pipeline
-    vectorstore = get_existing_vectorstore()
-
-    # 2. Check if the file already exists
-    existing_data = vectorstore.get(where={"source": file.filename})
-
-    if len(existing_data.get("ids", [])) > 0:
-        print(f"Skipping {file.filename}: Already exists in database.")
-        return {"status": "skipped", "message": f"'{file.filename}' is already embedded."}
-
-    # 3. Proceed with normal upload
-    if not file.filename.endswith('.pdf'):
+async def upload_pdf(
+    file: UploadFile = File(...),
+    embeddings: Optional[UploadFile] = File(default=None),
+    x_session_id: Optional[str] = Header(default=None),
+):
+    session_id = _require_session_id(x_session_id)
+    original_name = file.filename or "document.pdf"
+    if not original_name.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
 
-    file_path = os.path.join("docs", file.filename)
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    pack = await _read_embedding_pack(embeddings)
+    session = session_manager.get_or_create(session_id)
+    file_path, content_hash = await _save_pdf(file, os.path.join(session.temp_dir, "docs"))
 
-    print(f"\n--- NEW FILE UPLOADED: {file.filename} ---")
+    with session_manager.session_scope(session_id) as session:
+        if collection_has_hash(session.vectorstore, content_hash):
+            print(f"Skipping {original_name}: already in session.")
+            return {
+                "status": "skipped",
+                "message": f"'{original_name}' is already loaded in this session.",
+                "content_hash": content_hash,
+            }
 
-    try:
-        documents = load_documents_with_vision(docs_path="docs")
-        chunks = split_documents(documents)
-        create_vector_store(chunks)
+        print(f"\n--- NEW FILE UPLOADED: {original_name} ({content_hash[:12]}...) ---")
 
-        return {
-            "status": "success",
-            "message": f"{file.filename} ingested successfully.",
-            "chunks_created": len(chunks)
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        try:
+            if embedding_pack_is_valid(pack, content_hash):
+                chunks = import_embedding_pack(session.vectorstore, pack)
+                session.chunks.extend(chunks)
+                session.rebuild_retrievers()
+                return {
+                    "status": "restored",
+                    "message": f"'{original_name}' restored from client embeddings.",
+                    "chunks_created": len(chunks),
+                    "content_hash": content_hash,
+                }
+
+            if pack is not None:
+                print(
+                    f"Embedding pack mismatch for {original_name}; recomputing "
+                    f"(hash/model/chunks did not match)."
+                )
+
+            image_dir = os.path.join(session.temp_dir, "extracted_images", content_hash)
+            documents = load_documents_with_vision(
+                file_path=file_path,
+                output_image_dir=image_dir,
+                source_filename=original_name,
+                content_hash=content_hash,
+            )
+            chunks = split_documents(documents)
+            add_chunks_to_vectorstore(session.vectorstore, chunks, content_hash)
+            session.chunks.extend(chunks)
+            session.rebuild_retrievers()
+            embedding_pack = export_embedding_pack(
+                session.vectorstore, content_hash, original_name
+            )
+            return {
+                "status": "success",
+                "message": f"{original_name} ingested successfully.",
+                "chunks_created": len(chunks),
+                "content_hash": content_hash,
+                "embedding_pack": embedding_pack,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e)) from e
+
 
 @app.post("/query")
-async def query_rag(request: QueryRequest):
+async def query_rag(
+    request: QueryRequest,
+    x_session_id: Optional[str] = Header(default=None),
+):
+    session_id = _require_session_id(x_session_id)
     print(f"\n--- NEW RAG QUERY RECEIVED ---")
     print(f"Query: {request.query}")
-    
-    result = ask_question(request.query)
-    return result
+
+    with session_manager.session_scope(session_id) as session:
+        return ask_question(request.query, session)

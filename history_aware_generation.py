@@ -11,46 +11,14 @@ import json
 from collections import defaultdict
 
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
-from langchain_classic.retrievers import EnsembleRetriever
-from langchain_community.retrievers import BM25Retriever
 from langchain_core.documents import Document
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
-from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_ollama import ChatOllama
 from pydantic import BaseModel, Field
 from sentence_transformers import CrossEncoder
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Vector store + BM25 corpus 
-# ---------------------------------------------------------------------------
-persist_directory = "db/chroma_db"
-embedding_model = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-small-en-v1.5",
-    model_kwargs={"device": "cpu"}, 
-    encode_kwargs={"normalize_embeddings": True},
-)
-
-db = Chroma(
-    persist_directory=persist_directory,
-    embedding_function=embedding_model,
-    collection_name="rag_collection",
-    collection_metadata={"hnsw:space": "cosine"},
-)
-
-print(f"Total vectors stored in database: {db._collection.count()}")
-
-_raw = db.get(include=["documents", "metadatas"])
-chunks = [
-    Document(page_content=content, metadata=metadata or {})
-    for content, metadata in zip(_raw["documents"] or [], _raw["metadatas"] or [])
-]
-
-# ---------------------------------------------------------------------------
-# Models
-# ---------------------------------------------------------------------------
 llm = ChatOllama(
     model="llava",
     temperature=0.0,
@@ -60,31 +28,14 @@ llm = ChatOllama(
 
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
 
-# ---------------------------------------------------------------------------
-# Hybrid retriever
-# ---------------------------------------------------------------------------
-vector_retriever = db.as_retriever(
-    search_type="similarity",
-    search_kwargs={"k": 8},
-)
 
-if chunks:
-    bm25_retriever = BM25Retriever.from_documents(chunks)
-    bm25_retriever.k = 8
-    hybrid_retriever = EnsembleRetriever(
-        retrievers=[bm25_retriever, vector_retriever]
-    )
-else:
-    hybrid_retriever = vector_retriever
-
-chat_history = []
- 
 class QueryVariations(BaseModel):
     queries: list[str] = Field(
         min_length=3,
-	max_length=3,
-        description="A list of 3 standalone search queries based on the conversation"
+        max_length=3,
+        description="A list of 3 standalone search queries based on the conversation",
     )
+
 
 def create_query_variations(original_query: str, llm) -> list[str]:
     prompt = f"""Generate 3 different variations of the query that would help retrieve relevant documents:
@@ -95,19 +46,19 @@ def create_query_variations(original_query: str, llm) -> list[str]:
 
     llm_queries = llm.with_structured_output(QueryVariations, method="json_schema")
     query_variations = llm_queries.invoke(prompt)
-    
 
     if isinstance(query_variations, dict):
-      variations = result.get("queries", [])
+        variations = query_variations.get("queries", [])
     else:
-      variations = getattr(query_variations, "queries", [])
-    
+        variations = getattr(query_variations, "queries", [])
+
     variations = variations[:3]
     for i, variation in enumerate(variations, 1):
         print(f"{i}. {variation}")
 
     print("Generated Query variations")
     return variations
+
 
 def reciprocal_rank_fusion(chunk_lists, k=60, verbose=False):
     if verbose:
@@ -145,6 +96,7 @@ def reciprocal_rank_fusion(chunk_lists, k=60, verbose=False):
     sorted_chunks = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
     return [all_unique_chunks[content] for content, score in sorted_chunks]
 
+
 def get_answer_context(doc: Document) -> str:
     raw = doc.metadata.get("original_content")
     if not raw:
@@ -167,7 +119,16 @@ def get_answer_context(doc: Document) -> str:
 
     return "\n\n".join(parts) if parts else doc.page_content
 
-def ask_question(query):
+
+def ask_question(query, session):
+    chat_history = session.chat_history
+
+    if not session.chunks or session.hybrid_retriever is None:
+        answer = "I don't know"
+        chat_history.append(HumanMessage(content=query))
+        chat_history.append(AIMessage(content=answer))
+        return {"answer": answer, "context": []}
+
     if chat_history:
         messages = [
             SystemMessage(
@@ -188,7 +149,7 @@ def ask_question(query):
 
     for i, variation in enumerate(query_variations, 1):
         print(f"RESULTS FOR QUERY {i}: {variation}")
-        docs = hybrid_retriever.invoke(variation)
+        docs = session.hybrid_retriever.invoke(variation)
         all_retrieval_results.append(docs)
 
     print(f"\nFusing {len(all_retrieval_results)} query result lists with RRF...")
@@ -200,8 +161,6 @@ def ask_question(query):
         chat_history.append(HumanMessage(content=query))
         chat_history.append(AIMessage(content=answer))
         print(f"Answer: {answer}")
-        
-        # Return empty context array if nothing is found
         return {"answer": answer, "context": []}
 
     print("Reranking fused candidates with cross-encoder...")
@@ -232,10 +191,8 @@ def ask_question(query):
     chat_history.append(AIMessage(content=response.content))
 
     print(f"Answer: {response.content}")
-    
-    # Return both the LLM's generated answer and the source document excerpts
+
     return {
         "answer": response.content,
-        "context": [get_answer_context(doc) for doc in top_docs]
+        "context": [get_answer_context(doc) for doc in top_docs],
     }
-
