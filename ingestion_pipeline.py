@@ -1,7 +1,9 @@
 import os
 import math
 import base64
+import re
 from functools import lru_cache
+from html.parser import HTMLParser
 
 import chromadb
 from dotenv import load_dotenv
@@ -94,8 +96,180 @@ def _partition_pdf(file_path, output_image_dir):
         return partition_pdf(**kwargs)
 
 
+class _HTMLTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self._table = None
+        self._row = None
+        self._cell = None
+        self._in_cell = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in ("td", "th") and self._row is not None:
+            self._cell = []
+            self._in_cell = True
+
+    def handle_endtag(self, tag):
+        if tag in ("td", "th") and self._row is not None and self._cell is not None:
+            self._row.append("".join(self._cell).strip())
+            self._in_cell = False
+            self._cell = None
+        elif tag == "tr" and self._table is not None and self._row is not None:
+            self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            self.tables.append(self._table)
+            self._table = None
+
+    def handle_data(self, data):
+        if self._in_cell and self._cell is not None:
+            self._cell.append(data)
+
+
+def _clean_cell(value):
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def _normalize_table_rows(raw_rows):
+    if not raw_rows:
+        return []
+    width = max(len(row) for row in raw_rows)
+    rows = []
+    for raw in raw_rows:
+        row = [_clean_cell(cell) for cell in raw]
+        if len(row) < width:
+            row.extend([""] * (width - len(row)))
+        if any(row):
+            rows.append(row)
+    return rows
+
+
+def _parse_html_tables(html):
+    if not html or "<table" not in html.lower():
+        return []
+    parser = _HTMLTableParser()
+    try:
+        parser.feed(html)
+    except Exception:
+        return []
+    return [_normalize_table_rows(table) for table in parser.tables if table]
+
+
+def _table_fingerprint(rows):
+    cells = []
+    for row in rows[:6]:
+        for cell in row:
+            if cell:
+                cells.append(cell.lower())
+    return "|".join(cells)[:800]
+
+
+def _extract_tables_pdfplumber(file_path):
+    try:
+        import pdfplumber
+    except ImportError:
+        print("pdfplumber not installed; using unstructured table elements only.")
+        return []
+
+    tables = []
+    with pdfplumber.open(file_path) as pdf:
+        for page_number, page in enumerate(pdf.pages, 1):
+            extracted = page.extract_tables() or []
+            for raw_table in extracted:
+                rows = _normalize_table_rows(raw_table)
+                if len(rows) >= 2:
+                    tables.append({"page": page_number, "rows": rows})
+    print(f"pdfplumber found {len(tables)} tables in {os.path.basename(file_path)}.")
+    return tables
+
+
+def _extract_tables_unstructured(elements):
+    tables = []
+    for element in elements:
+        type_name = type(element).__name__
+        if "Table" not in type_name:
+            continue
+        html = getattr(getattr(element, "metadata", None), "text_as_html", None)
+        parsed = _parse_html_tables(html) if html else []
+        rows = parsed[0] if parsed else _normalize_table_rows(
+            [line.split("\t") for line in (element.text or "").splitlines() if line.strip()]
+        )
+        if len(rows) >= 2:
+            tables.append({"page": None, "rows": rows})
+    return tables
+
+
+def _headers_from_row(row):
+    headers = []
+    for index, cell in enumerate(row, 1):
+        headers.append(cell if cell else f"Column {index}")
+    return headers
+
+
+def verbalize_table(rows, source, table_index, page=None):
+    headers = _headers_from_row(rows[0])
+    location = f" from {source}"
+    if page:
+        location += f" page {page}"
+    lines = [f"Table {table_index}{location}."]
+    body = rows[1:] if len(rows) > 1 else []
+    for row in body:
+        pairs = []
+        for header, value in zip(headers, row):
+            if value:
+                pairs.append(f"{header} is {value}")
+        if pairs:
+            lines.append("Row: " + "; ".join(pairs) + ".")
+    return "\n".join(lines)
+
+
+def _table_documents(tables, source_filename, content_hash, max_rows=12):
+    documents = []
+    seen = set()
+    table_index = 0
+    for table in tables:
+        rows = table["rows"]
+        fingerprint = _table_fingerprint(rows)
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        table_index += 1
+        headers = [rows[0]]
+        body = rows[1:]
+        if not body:
+            continue
+        for start in range(0, len(body), max_rows):
+            chunk_rows = headers + body[start:start + max_rows]
+            metadata = {
+                "source": source_filename,
+                "type": "table",
+            }
+            if content_hash:
+                metadata["content_hash"] = content_hash
+            documents.append(
+                Document(
+                    page_content=verbalize_table(
+                        chunk_rows,
+                        source_filename,
+                        table_index,
+                        page=table.get("page"),
+                    ),
+                    metadata=metadata,
+                )
+            )
+    print(f"Created {len(documents)} verbalized table chunks for {source_filename}.")
+    return documents
+
+
 def load_documents_with_vision(file_path, output_image_dir, source_filename=None, content_hash=None):
-    """Extract text AND images from a single PDF, summarize images, and combine into documents."""
+    """Extract text, tables, and images; verbalize tables for a small language model."""
     filename = source_filename or os.path.basename(file_path)
     print(f"Loading and partitioning {filename}...")
     os.makedirs(output_image_dir, exist_ok=True)
@@ -113,6 +287,12 @@ def load_documents_with_vision(file_path, output_image_dir, source_filename=None
             all_documents.append(
                 Document(page_content=element.text, metadata=dict(base_metadata))
             )
+
+    plumber_tables = _extract_tables_pdfplumber(file_path)
+    unstructured_tables = _extract_tables_unstructured(raw_pdf_elements)
+    all_documents.extend(
+        _table_documents(plumber_tables + unstructured_tables, filename, content_hash)
+    )
 
     for image_name in os.listdir(output_image_dir):
         if not image_name.lower().endswith((".png", ".jpg", ".jpeg")):
@@ -145,7 +325,9 @@ def split_documents(documents, chunk_size=1000, chunk_overlap=200, separators=["
         separators=separators,
     )
 
-    chunks = text_splitter.split_documents(documents)
+    preserved = [doc for doc in documents if doc.metadata.get("type") == "table"]
+    splittable = [doc for doc in documents if doc.metadata.get("type") != "table"]
+    chunks = text_splitter.split_documents(splittable) + preserved
 
     if chunks:
         for i, chunk in enumerate(chunks[:2]):

@@ -8,6 +8,7 @@ Query flow:
 """
 
 import json
+import re
 from collections import defaultdict
 
 from dotenv import load_dotenv
@@ -22,7 +23,7 @@ load_dotenv()
 llm = ChatOllama(
     model="llava",
     temperature=0.0,
-    num_ctx=2048,
+    num_ctx=4096,
     num_predict=1024,
 )
 
@@ -120,6 +121,18 @@ def get_answer_context(doc: Document) -> str:
     return "\n\n".join(parts) if parts else doc.page_content
 
 
+def extract_display_answer(raw_text: str) -> str:
+    if not raw_text:
+        return ""
+    match = re.search(r"<final_answer>(.*?)</final_answer>", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    if match:
+        return re.sub(r"\s+", " ", match.group(1)).strip()
+    cleaned = re.sub(r"<reasoning>.*?</reasoning>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"</?final_answer>", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"</?reasoning>", "", cleaned, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", cleaned).strip() or raw_text.strip()
+
+
 def ask_question(query, session):
     chat_history = session.chat_history
 
@@ -168,7 +181,7 @@ def ask_question(query, session):
     scores = reranker.predict(pairs)
     scored_docs = sorted(zip(scores, fused_docs), key=lambda x: x[0], reverse=True)
 
-    top_docs = [doc for score, doc in scored_docs[:5]]
+    top_docs = [doc for score, doc in scored_docs[:3]]
 
     combined_docs = "\n\n".join(get_answer_context(doc) for doc in top_docs)
 
@@ -180,19 +193,20 @@ def ask_question(query, session):
     Question: {query}
 
     Instructions:
-    Think step-by-step about the context to identify the correct figures and resolve any conflicting numbers. Write your thought process inside <reasoning> tags. 
-    After you have completed your reasoning, write your final answer inside <final_answer> tags. Do not use numbered lists.
+    Tables are written as sentences like "Row: Header is value". Treat each Row as one complete record; do not mix values across rows.
+    Reply with a short direct answer only. Put it inside <final_answer> tags. Do not write reasoning, lists, or extra commentary.
 
     Answer:"""
 
     response = llm.invoke(prompt)
+    display_answer = extract_display_answer(response.content)
 
     chat_history.append(HumanMessage(content=query))
-    chat_history.append(AIMessage(content=response.content))
+    chat_history.append(AIMessage(content=display_answer))
 
-    print(f"Answer: {response.content}")
+    print(f"Answer: {display_answer}")
 
     return {
-        "answer": response.content,
+        "answer": display_answer,
         "context": [get_answer_context(doc) for doc in top_docs],
     }
