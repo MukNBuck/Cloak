@@ -429,6 +429,33 @@ def extract_reasoning(raw_text: str) -> str:
     return ""
 
 
+def distinct_reasoning(answer, reasoning):
+    """Hide reasoning that is just a copy of the visible answer."""
+    answer_l = re.sub(r"\s+", " ", (answer or "")).strip().lower()
+    text = re.sub(r"\s+", " ", (reasoning or "")).strip()
+    if not text:
+        return ""
+    reason_l = text.lower()
+    if not answer_l:
+        return text
+    if reason_l == answer_l or reason_l in answer_l or answer_l in reason_l:
+        return ""
+    answer_words = set(answer_l.split())
+    reason_words = set(reason_l.split())
+    if reason_words and len(answer_words & reason_words) / len(reason_words) >= 0.8:
+        return ""
+    return text
+
+
+def session_cancelled(session):
+    event = getattr(session, "cancel", None)
+    return event is not None and event.is_set()
+
+
+def _stopped(citations=None):
+    return _complete("Stopped.", citations)
+
+
 def _build_citations(top_docs):
     citations = []
     for index, doc in enumerate(top_docs, 1):
@@ -507,10 +534,12 @@ def _rerank_scores(search_question, rerank_docs):
         return [float(len(rerank_docs) - index) for index in range(len(rerank_docs))]
 
 
-def _run_llm(prompt):
+def _run_llm(prompt, session=None):
     assembled = []
     try:
         for chunk in llm.stream(prompt):
+            if session_cancelled(session):
+                return
             piece = getattr(chunk, "content", None) or ""
             if piece:
                 assembled.append(piece)
@@ -518,6 +547,8 @@ def _run_llm(prompt):
         return
     except Exception as exc:
         print(f"LLM stream failed, using invoke: {exc}")
+    if session_cancelled(session):
+        return
     response = llm.invoke(prompt)
     text = response.content or ""
     yield text, text
@@ -525,6 +556,9 @@ def _run_llm(prompt):
 
 def ask_question_events(query, session):
     chat_history = session.chat_history
+
+    def cancelled():
+        return session_cancelled(session)
 
     if not session.chunks and session.vectorstore is not None:
         session.chunks = load_chunks_from_vectorstore(session.vectorstore)
@@ -535,6 +569,10 @@ def ask_question_events(query, session):
         answer = "I don't know"
         _remember(chat_history, query, answer)
         yield _complete(answer)
+        return
+
+    if cancelled():
+        yield _stopped()
         return
 
     search_question = rewrite_with_history(query, chat_history)
@@ -575,6 +613,9 @@ def ask_question_events(query, session):
     all_retrieval_results = []
     fetched = 0
     for i, variation in enumerate(query_variations, 1):
+        if cancelled():
+            yield _stopped()
+            return
         print(f"RESULTS FOR QUERY {i}: {variation}")
         docs = _retrieve(session, variation)
         fetched += len(docs or [])
@@ -592,6 +633,10 @@ def ask_question_events(query, session):
     )
     fused_docs = prepend_unique(exact_docs, fused_docs)
     print(f"RRF produced {len(fused_docs)} unique candidates")
+
+    if cancelled():
+        yield _stopped()
+        return
 
     if not fused_docs:
         answer = "I don't know"
@@ -635,6 +680,10 @@ def ask_question_events(query, session):
             f"page={meta.get('page')} section={meta.get('section')} {preview!r}"
         )
 
+    if cancelled():
+        yield _stopped()
+        return
+
     history_block = _history_block(chat_history)
     char_budget = source_char_budget(query, history_block)
     combined_docs, top_docs = pack_context(candidate_docs, char_budget)
@@ -658,7 +707,7 @@ def ask_question_events(query, session):
         "type": "stage",
         "id": "reasoning",
         "label": "Reasoning",
-        "detail": "Reading the selected chunks",
+        "detail": "Writing the answer",
         "citations": citations,
     }
 
@@ -671,28 +720,23 @@ Question: {query}
 
 Tables are written as "Row: Header is value". Do not mix values across rows.
 Do not invent names, numbers, dates, or quotes that are not in the sources.
-First write a short <reasoning> of 2-4 sentences naming the source numbers you used.
-Then put a short direct answer inside <final_answer> tags.
+Write <reasoning> that only names which source numbers you used and why they are relevant. Do not repeat the answer there.
+Then put the user-facing answer only inside <final_answer> tags.
 
 Answer:"""
 
     assembled = ""
-    last_detail = None
-    for _piece, assembled in _run_llm(prompt):
-        detail = extract_reasoning(assembled) or "Writing the answer"
-        if detail == last_detail:
-            continue
-        last_detail = detail
-        yield {
-            "type": "stage",
-            "id": "reasoning",
-            "label": "Reasoning",
-            "detail": detail,
-            "citations": citations,
-        }
+    for _piece, assembled in _run_llm(prompt, session):
+        if cancelled():
+            yield _stopped(citations)
+            return
+
+    if cancelled():
+        yield _stopped(citations)
+        return
 
     display_answer = extract_display_answer(assembled)
-    reasoning = extract_reasoning(assembled)
+    reasoning = distinct_reasoning(display_answer, extract_reasoning(assembled))
     _remember(chat_history, query, display_answer)
     print(f"Answer: {display_answer}")
 

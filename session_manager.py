@@ -32,6 +32,7 @@ class SessionState:
         self.chat_history = []
         self.hybrid_retriever = None
         self.bm25_retriever = None
+        self.cancel = threading.Event()
         self.last_seen = time.time()
         self.in_use = 0
         self._close_requested = False
@@ -113,6 +114,15 @@ class SessionManager:
             session.last_seen = time.time()
             return session
 
+    def request_cancel(self, session_id):
+        with self._lock:
+            session = self._sessions.get(session_id)
+        if session is None:
+            return False
+        session.cancel.set()
+        print(f"Cancel requested for session {session_id}")
+        return True
+
     @contextmanager
     def session_scope(self, session_id):
         session = self.get_or_create(session_id)
@@ -133,6 +143,7 @@ class SessionManager:
             if session is None:
                 return False
             session._close_requested = True
+            session.cancel.set()
             if session.in_use > 0:
                 print(f"Session {session_id} close deferred until in-flight request finishes.")
                 return True

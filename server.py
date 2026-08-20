@@ -186,7 +186,15 @@ async def query_rag(
     print(f"Query: {request.query}")
 
     with session_manager.session_scope(session_id) as session:
+        session.cancel.clear()
         return ask_question(request.query, session)
+
+
+@app.post("/query/cancel")
+async def cancel_query(x_session_id: Optional[str] = Header(default=None)):
+    session_id = _require_session_id(x_session_id)
+    cancelled = session_manager.request_cancel(session_id)
+    return {"status": "cancelling" if cancelled else "idle", "session_id": session_id}
 
 
 @app.post("/query/stream")
@@ -200,6 +208,7 @@ async def query_rag_stream(
 
     def event_stream():
         with session_manager.session_scope(session_id) as session:
+            session.cancel.clear()
             for event in ask_question_events(request.query, session):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
