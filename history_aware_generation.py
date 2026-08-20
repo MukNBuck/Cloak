@@ -511,8 +511,8 @@ def ask_question_events(query, session):
     Tables are written as sentences like "Row: Header is value". Treat each Row as one complete record; do not mix values across rows.
     Rely on explicit tables and lists before inferring answers from partial acronyms or variable names. CAP in SENSOR_CAPP is not capacitive touch.
     If the context has a related metric but not the asked quantity or unit (for example mA when the question asks for dBm), respond with "I don't know".
-    First write a short <reasoning> of 2-4 sentences naming the pages or tables you used.
-    Then put a short direct answer inside <final_answer> tags. Do not put reasoning in the final answer.
+    First write a short <reasoning> of 2-4 sentences naming the pages or tables you used and why they answer the question.
+    Then put a short direct answer inside <final_answer> tags. The final answer must not include the reasoning.
 
     Answer:"""
 
@@ -554,6 +554,7 @@ def ask_question(query, session):
                 "answer": event.get("answer") or "",
                 "context": event.get("context") or [],
                 "citations": event.get("citations") or [],
+                "reasoning": event.get("reasoning") or "",
             }
     return result
  
