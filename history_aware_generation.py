@@ -485,6 +485,28 @@ def _identifier_boost(text_l, keys):
     return 0.0
 
 
+def _retrieve(session, variation):
+    try:
+        return session.hybrid_retriever.invoke(variation) or []
+    except Exception as exc:
+        print(f"Vector search failed ({exc}); using keyword search only.")
+        if session.bm25_retriever is not None:
+            try:
+                return session.bm25_retriever.invoke(variation) or []
+            except Exception as bm25_exc:
+                print(f"BM25 search also failed: {bm25_exc}")
+        return []
+
+
+def _rerank_scores(search_question, rerank_docs):
+    pairs = [[search_question, doc.page_content] for doc in rerank_docs]
+    try:
+        return reranker.predict(pairs)
+    except Exception as exc:
+        print(f"Reranker failed ({exc}); keeping retrieval order.")
+        return [float(len(rerank_docs) - index) for index in range(len(rerank_docs))]
+
+
 def _run_llm(prompt):
     assembled = []
     try:
@@ -554,7 +576,7 @@ def ask_question_events(query, session):
     fetched = 0
     for i, variation in enumerate(query_variations, 1):
         print(f"RESULTS FOR QUERY {i}: {variation}")
-        docs = session.hybrid_retriever.invoke(variation)
+        docs = _retrieve(session, variation)
         fetched += len(docs or [])
         all_retrieval_results.append(docs)
         yield {
@@ -586,8 +608,7 @@ def ask_question_events(query, session):
     }
     print("Reranking fused candidates with cross-encoder...")
     rerank_docs = fused_docs[:RERANK_CANDIDATES]
-    pairs = [[search_question, doc.page_content] for doc in rerank_docs]
-    scores = reranker.predict(pairs)
+    scores = _rerank_scores(search_question, rerank_docs)
     question_l = search_question.lower()
     keys = _strict_terms(search_question)
     wants_appendix = "appendix" in question_l or "annex" in question_l

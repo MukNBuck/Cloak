@@ -31,6 +31,7 @@ class SessionState:
         self.chunks = []
         self.chat_history = []
         self.hybrid_retriever = None
+        self.bm25_retriever = None
         self.last_seen = time.time()
         self.in_use = 0
         self._close_requested = False
@@ -43,6 +44,7 @@ class SessionState:
             search_kwargs={"k": RETRIEVE_K},
         )
         usable = [chunk for chunk in self.chunks if (chunk.page_content or "").strip()]
+        self.bm25_retriever = None
         if usable:
             try:
                 bm25_retriever = BM25Retriever.from_documents(
@@ -50,6 +52,7 @@ class SessionState:
                     preprocess_func=_bm25_tokens,
                 )
                 bm25_retriever.k = RETRIEVE_K
+                self.bm25_retriever = bm25_retriever
                 self.hybrid_retriever = EnsembleRetriever(
                     retrievers=[bm25_retriever, vector_retriever],
                     weights=[0.55, 0.45],
@@ -68,6 +71,7 @@ class SessionState:
         self.chunks = []
         self.chat_history = []
         self.hybrid_retriever = None
+        self.bm25_retriever = None
         self.vectorstore = None
         self._chroma_client = None
         shutil.rmtree(self.temp_dir, ignore_errors=True)

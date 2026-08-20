@@ -4,6 +4,7 @@ Nothing here talks to the public internet. Ollama and Hugging Face models
 must already be on disk; set CLOAK_OFFLINE=1 after the first cache.
 """
 
+from functools import lru_cache
 import os
 
 from dotenv import load_dotenv
@@ -49,15 +50,30 @@ if OFFLINE:
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 
+@lru_cache(maxsize=1)
 def torch_device():
+    """Pick a device that can actually run kernels, not just one CUDA reports."""
+    forced = os.getenv("CLOAK_DEVICE", "").strip().lower()
+    if forced == "cpu":
+        print("CLOAK_DEVICE=cpu; embeddings and rerank stay on CPU.")
+        return "cpu"
     try:
         import torch
 
-        if torch.cuda.is_available():
-            return "cuda"
-    except Exception:
-        pass
-    return "cpu"
+        if not torch.cuda.is_available():
+            return "cpu"
+        left = torch.randn(32, 32, device="cuda")
+        right = torch.randn(32, 32, device="cuda")
+        _ = (left @ right).cpu()
+        torch.cuda.synchronize()
+        print(f"CUDA usable for embeddings/rerank: {torch.cuda.get_device_name(0)}")
+        return "cuda"
+    except Exception as exc:
+        print(
+            f"CUDA cannot run this PyTorch build ({exc}). "
+            "Embeddings and rerank will use CPU. Ollama can still use the GPU."
+        )
+        return "cpu"
 
 
 def describe():
