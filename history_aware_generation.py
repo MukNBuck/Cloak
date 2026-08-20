@@ -1,49 +1,53 @@
 """
-History-aware RAG chat pipeline.
+History-aware RAG chat pipeline. All models run locally (Ollama + on-disk HF).
 
 Query flow:
-  question → (optional history rewrite) → multi-query
-  → hybrid search (BM25 + vector) → RRF across queries
-  → cross-encoder rerank → answer from original_content
+  question → heuristic follow-up rewrite (no LLM)
+  → exact-term scan + hybrid search (BM25 + vector)
+  → cross-encoder rerank → answer from retrieved chunks
 """
 
 import json
 import re
 from collections import defaultdict
 
-from dotenv import load_dotenv
 from langchain_core.documents import Document
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
-from pydantic import BaseModel, Field
 from sentence_transformers import CrossEncoder
 
+from cloak_config import (
+    CHARS_PER_TOKEN,
+    HISTORY_MESSAGES,
+    LLM_MODEL,
+    MAX_CHUNK_CHARS,
+    MAX_CONTEXT_CHARS,
+    MAX_PACKED_DOCS,
+    NUM_CTX,
+    NUM_PREDICT,
+    OFFLINE,
+    PROMPT_RESERVE_TOKENS,
+    RERANK_CANDIDATES,
+    RERANK_MODEL,
+    TOP_DOCS,
+    torch_device,
+)
 from ingestion_pipeline import load_chunks_from_vectorstore
 
-load_dotenv()
+_DEVICE = torch_device()
 
 llm = ChatOllama(
-    model="llava",
+    model=LLM_MODEL,
     temperature=0.0,
-    num_ctx=4096,
-    num_predict=1024,
+    num_ctx=NUM_CTX,
+    num_predict=NUM_PREDICT,
 )
 
-reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2", device="cpu")
+try:
+    reranker = CrossEncoder(RERANK_MODEL, device=_DEVICE, local_files_only=OFFLINE)
+except TypeError:
+    reranker = CrossEncoder(RERANK_MODEL, device=_DEVICE)
 
-
-class QueryVariations(BaseModel):
-    queries: list[str] = Field(
-        min_length=2,
-        max_length=2,
-        description="Two search queries that keep the original technical terms",
-    )
-
-
-SPEC_HINTS = (
-    "dbm", "ma", "gpio", "pin", "sensitivity", "touch", "capacitive",
-    "mhz", "voltage", "current", "table", "mapping", "restriction",
-)
 APPENDIX_HEADING_RE = re.compile(
     r"(?im)^\s*(appendix|annex)(\s+[a-z0-9]+)?\b"
 )
@@ -52,8 +56,16 @@ REFUSAL_RE = re.compile(
     re.I,
 )
 FOLLOWUP_RE = re.compile(
-    r"\b(it|its|this|that|these|those|they|them|the pin|the rail|the table|same|previous)\b",
+    r"\b(it|its|this|that|these|those|they|them|the same|previous|above)\b",
     re.I,
+)
+TABLE_QUERY_RE = re.compile(r"\b(table|tables|figure|figures|chart|schedule)\b", re.I)
+STOPWORDS = frozenset(
+    """
+    a an and are as at be by can could did do does for from how i if in into is it
+    its me of on or please should show tell than that the these this those to was
+    were what when where which who why with would you your
+    """.split()
 )
 
 
@@ -61,14 +73,50 @@ def _tokens(text):
     return [token for token in re.findall(r"[A-Za-z][A-Za-z0-9_./+-]{1,}", text or "")]
 
 
+def _quoted_phrases(text):
+    phrases = []
+    for match in re.finditer(r'"([^"]{2,80})"|“([^”]{2,80})”', text or ""):
+        phrase = (match.group(1) or match.group(2) or "").strip()
+        if phrase:
+            phrases.append(phrase)
+    return phrases
+
+
+def _is_strict_term(token):
+    if any(character.isdigit() or character == "_" for character in token):
+        return True
+    return token.isupper() and len(token) >= 3
+
+
+def _dedupe(items):
+    seen = set()
+    unique = []
+    for item in items:
+        key = item.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 def _key_terms(text):
-    terms = []
+    terms = list(_quoted_phrases(text))
     for token in _tokens(text):
-        if any(character.isdigit() or character == "_" for character in token):
+        lowered = token.lower()
+        if lowered in STOPWORDS:
+            continue
+        if _is_strict_term(token) or token[0].isupper() or len(token) >= 6:
             terms.append(token)
-        elif token.isupper() and len(token) >= 3:
+    return _dedupe(terms)
+
+
+def _strict_terms(text):
+    terms = list(_quoted_phrases(text))
+    for token in _tokens(text):
+        if _is_strict_term(token):
             terms.append(token)
-    return terms
+    return _dedupe(terms)
 
 
 def _keeps_key_terms(text, original):
@@ -94,64 +142,63 @@ def sanitize_search_question(rewritten, original):
     text = re.sub(r"\s+", " ", text).strip().strip('"')
     if not text or REFUSAL_RE.match(text) or len(text) < 4:
         return original
-    if not _keeps_key_terms(text, original):
+    if not _keeps_key_terms(text, original) and not _key_terms(text):
         return original
     if len(text) > 220:
         return original
     return text
 
 
-def _fallback_variations(original_query):
+def rewrite_with_history(query, chat_history):
+    """Resolve pronouns from the last human question. No LLM call."""
+    if not needs_history_rewrite(query, chat_history):
+        return query
+    last_human = None
+    for message in reversed(chat_history):
+        if isinstance(message, HumanMessage):
+            last_human = message.content
+            break
+    if not last_human:
+        return query
+    keys = _key_terms(last_human)[:6]
+    if not keys or _key_terms(query):
+        return query
+    rewritten = f"{' '.join(keys)} {query}"
+    return sanitize_search_question(rewritten, query)
+
+
+def search_queries(original_query):
+    """Keyword variants only. Local LLMs invent terms if asked to rewrite searches."""
+    queries = [original_query]
     keys = _key_terms(original_query)
     if not keys:
-        return [f"{original_query} definition", f"{original_query} pin voltage"]
-    primary = keys[0]
-    return [
-        f"what is {primary}",
-        f"{primary} pin power rail voltage",
-    ]
+        return queries
+    joined = " ".join(keys)
+    if joined.lower() != original_query.lower():
+        queries.append(joined)
+    return queries[:2]
 
 
-def create_query_variations(original_query: str, llm) -> list[str]:
-    keys = _key_terms(original_query)
-    keep = ", ".join(keys) if keys else original_query
-    prompt = f"""Generate 2 alternative SEARCH queries for a PDF datasheet.
-
-Original query: {original_query}
-
-Rules:
-Keep these terms exactly: {keep}
-Do not invent parts, metrics, or features that are not in the original query.
-Do not answer the question. Return only search queries."""
-
-    try:
-        llm_queries = llm.with_structured_output(QueryVariations, method="json_schema")
-        query_variations = llm_queries.invoke(prompt)
-        if isinstance(query_variations, dict):
-            variations = query_variations.get("queries", [])
-        else:
-            variations = getattr(query_variations, "queries", [])
-    except Exception as exc:
-        print(f"Query variation LLM failed: {exc}")
-        variations = []
-
-    cleaned = []
-    for variation in variations[:2]:
-        text = sanitize_search_question(str(variation or ""), original_query)
-        if text != original_query and text not in cleaned:
-            cleaned.append(text)
-
-    if len(cleaned) < 2:
-        for fallback in _fallback_variations(original_query):
-            if fallback not in cleaned and fallback != original_query:
-                cleaned.append(fallback)
-            if len(cleaned) >= 2:
-                break
-
-    for i, variation in enumerate(cleaned[:2], 1):
-        print(f"{i}. {variation}")
-    print("Generated Query variations")
-    return cleaned[:2]
+def lexical_hits(query, chunks, limit=8):
+    """Boost chunks that literally contain names, IDs, or quoted phrases."""
+    keys = _strict_terms(query)
+    if not keys or not chunks:
+        return []
+    scored = []
+    for chunk in chunks:
+        text = chunk.page_content or ""
+        text_l = text.lower()
+        hits = 0
+        for key in keys:
+            count = text_l.count(key.lower())
+            if count:
+                hits += 2 + min(count, 5)
+        if not hits:
+            continue
+        density = hits / max(len(text) / 400.0, 1.0)
+        scored.append((hits + density, chunk))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    return [chunk for _, chunk in scored[:limit]]
 
 
 def reciprocal_rank_fusion(chunk_lists, k=60, query_weights=None, verbose=False):
@@ -194,6 +241,17 @@ def reciprocal_rank_fusion(chunk_lists, k=60, query_weights=None, verbose=False)
     return [all_unique_chunks[content] for content, score in sorted_chunks]
 
 
+def prepend_unique(preferred, existing):
+    seen = {doc.page_content for doc in preferred}
+    merged = list(preferred)
+    for doc in existing:
+        if doc.page_content in seen:
+            continue
+        seen.add(doc.page_content)
+        merged.append(doc)
+    return merged
+
+
 def get_answer_context(doc: Document) -> str:
     raw = doc.metadata.get("original_content")
     if not raw:
@@ -217,11 +275,81 @@ def get_answer_context(doc: Document) -> str:
     return "\n\n".join(parts) if parts else doc.page_content
 
 
-def citation_excerpt(doc: Document, max_len=420) -> str:
-    text = re.sub(r"\s+", " ", (doc.page_content or "").strip())
-    if len(text) <= max_len:
+def _clip(text, limit):
+    text = re.sub(r"[ \t]+", " ", (text or "").strip())
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    if len(text) <= limit:
         return text
-    return text[:max_len].rsplit(" ", 1)[0] + "…"
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def _chars_from_tokens(tokens):
+    return int(max(0, tokens) * CHARS_PER_TOKEN)
+
+
+def _history_block(chat_history):
+    if not chat_history:
+        return ""
+    lines = []
+    for message in chat_history[-HISTORY_MESSAGES:]:
+        role = "User" if isinstance(message, HumanMessage) else "Assistant"
+        content = _clip(getattr(message, "content", None) or "", 360)
+        if content:
+            lines.append(f"{role}: {content}")
+    if not lines:
+        return ""
+    return "Recent conversation:\n" + "\n".join(lines)
+
+
+def source_char_budget(query, history_block=""):
+    """Leave room for prompt, question, history, and the answer. Fill the rest with sources."""
+    window = _chars_from_tokens(NUM_CTX)
+    reserved = _chars_from_tokens(NUM_PREDICT + PROMPT_RESERVE_TOKENS)
+    leftover = window - reserved - len(query or "") - len(history_block or "")
+    leftover = max(_chars_from_tokens(160), leftover)
+    if MAX_CONTEXT_CHARS > 0:
+        leftover = min(leftover, MAX_CONTEXT_CHARS)
+    return leftover
+
+
+def _source_block(index, doc, clip_limit):
+    meta = doc.metadata or {}
+    loc = f"{meta.get('source') or 'document.pdf'} p.{meta.get('page', '?')} {meta.get('type') or 'text'}"
+    body = _clip(get_answer_context(doc), clip_limit)
+    return f"[Source {index} | {loc}]\n{body}"
+
+
+def pack_context(docs, char_budget):
+    """Fit as many reranked chunks as the leftover window allows."""
+    if not docs:
+        return "", []
+    target = max(TOP_DOCS, 1)
+    clip_limit = min(MAX_CHUNK_CHARS, max(320, char_budget // target))
+    parts = []
+    packed = []
+    used = 0
+    for doc in docs:
+        index = len(packed) + 1
+        block = _source_block(index, doc, clip_limit)
+        extra = len(block) + (2 if parts else 0)
+        if packed and used + extra > char_budget:
+            break
+        if not packed and extra > char_budget:
+            tighter = max(200, char_budget - 80)
+            block = _source_block(1, doc, tighter)
+            extra = len(block)
+        parts.append(block)
+        packed.append(doc)
+        used += extra
+    print(
+        f"Packed {len(packed)} sources using {used}/{char_budget} chars "
+        f"(ctx={NUM_CTX}, predict={NUM_PREDICT})"
+    )
+    return "\n\n".join(parts), packed
+
+
+def citation_excerpt(doc: Document, max_len=420) -> str:
+    return _clip(doc.page_content or "", max_len)
 
 
 def appendix_start_page(chunks):
@@ -256,7 +384,8 @@ def chunk_is_appendix(doc: Document, appendix_start=None) -> bool:
     return False
 
 
-def select_top_docs(scored_docs, limit=5, per_page=2):
+def select_top_docs(scored_docs, limit=None, per_page=2):
+    limit = limit or TOP_DOCS
     picked = []
     page_counts = defaultdict(int)
     for _score, doc in scored_docs:
@@ -335,6 +464,27 @@ def _complete(answer, citations=None):
     }
 
 
+def _trim_history(chat_history):
+    if len(chat_history) > HISTORY_MESSAGES:
+        del chat_history[:-HISTORY_MESSAGES]
+
+
+def _remember(chat_history, query, answer):
+    chat_history.append(HumanMessage(content=query))
+    chat_history.append(AIMessage(content=answer or ""))
+    _trim_history(chat_history)
+
+
+def _identifier_boost(text_l, keys):
+    if not keys:
+        return 0.0
+    if all(key.lower() in text_l for key in keys):
+        return 1.5
+    if any(key.lower() in text_l for key in keys):
+        return 0.5
+    return 0.0
+
+
 def _run_llm(prompt):
     assembled = []
     try:
@@ -361,38 +511,20 @@ def ask_question_events(query, session):
     print(f"Session has {len(session.chunks)} chunks")
     if not session.chunks or session.hybrid_retriever is None:
         answer = "I don't know"
-        chat_history.append(HumanMessage(content=query))
-        chat_history.append(AIMessage(content=answer))
+        _remember(chat_history, query, answer)
         yield _complete(answer)
         return
 
-    if needs_history_rewrite(query, chat_history):
+    search_question = rewrite_with_history(query, chat_history)
+    if search_question != query:
+        print(f"Follow-up resolved to: {search_question}")
         yield {
             "type": "stage",
             "id": "understanding",
             "label": "Understanding the question",
-            "detail": "Rewriting a follow-up into a search query",
+            "detail": search_question[:120],
         }
-        messages = [
-            SystemMessage(
-                content=(
-                    "Rewrite the user's follow-up into one standalone SEARCH query. "
-                    "Do not answer it. Never reply with I don't know. "
-                    "Keep pin names, rail names, part numbers, and units exactly. "
-                    "Return only the rewritten query."
-                )
-            )
-        ] + chat_history[-6:] + [
-            HumanMessage(content=f"Standalone search query for: {query}")
-        ]
-        result = llm.invoke(messages)
-        search_question = sanitize_search_question(result.content, query)
-        if search_question != query:
-            print(f"Rewrote follow-up to: {search_question}")
-        else:
-            print("History rewrite ignored; using the original question.")
     else:
-        search_question = query
         if chat_history:
             print("Skipping history rewrite; question is already standalone.")
         yield {
@@ -408,10 +540,15 @@ def ask_question_events(query, session):
         "type": "stage",
         "id": "fetching",
         "label": "Fetching chunks",
-        "detail": "Planning search queries",
+        "detail": "Keyword scan and hybrid search",
     }
-    query_variations = [search_question] + create_query_variations(search_question, llm)
-    query_weights = [2.0] + [1.0] * (len(query_variations) - 1)
+    query_variations = search_queries(search_question)
+    for i, variation in enumerate(query_variations, 1):
+        print(f"{i}. {variation}")
+    query_weights = [2.0] + [1.2] * (len(query_variations) - 1)
+
+    exact_docs = lexical_hits(search_question, session.chunks)
+    print(f"Exact-term scan found {len(exact_docs)} matching chunks")
 
     all_retrieval_results = []
     fetched = 0
@@ -431,12 +568,12 @@ def ask_question_events(query, session):
     fused_docs = reciprocal_rank_fusion(
         all_retrieval_results, k=60, query_weights=query_weights
     )
+    fused_docs = prepend_unique(exact_docs, fused_docs)
     print(f"RRF produced {len(fused_docs)} unique candidates")
 
     if not fused_docs:
         answer = "I don't know"
-        chat_history.append(HumanMessage(content=query))
-        chat_history.append(AIMessage(content=answer))
+        _remember(chat_history, query, answer)
         print(f"Answer: {answer}")
         yield _complete(answer)
         return
@@ -448,26 +585,27 @@ def ask_question_events(query, session):
         "detail": f"{len(fused_docs)} unique chunks",
     }
     print("Reranking fused candidates with cross-encoder...")
-    rerank_docs = fused_docs[:24]
+    rerank_docs = fused_docs[:RERANK_CANDIDATES]
     pairs = [[search_question, doc.page_content] for doc in rerank_docs]
     scores = reranker.predict(pairs)
     question_l = search_question.lower()
+    keys = _strict_terms(search_question)
     wants_appendix = "appendix" in question_l or "annex" in question_l
-    boost_tables = any(hint in question_l for hint in SPEC_HINTS)
+    boost_tables = bool(TABLE_QUERY_RE.search(search_question))
     appendix_start = None if wants_appendix else appendix_start_page(session.chunks)
     scored_docs = []
     for score, doc in zip(scores, rerank_docs):
         adjusted = float(score)
         text_l = (doc.page_content or "").lower()
+        adjusted += _identifier_boost(text_l, keys)
         if boost_tables and doc.metadata.get("type") == "table":
-            if any(hint in text_l for hint in SPEC_HINTS if hint in question_l):
-                adjusted += 0.35
+            adjusted += 0.35
         if not wants_appendix and chunk_is_appendix(doc, appendix_start):
-            adjusted -= 1.2
+            adjusted -= 0.4
         scored_docs.append((adjusted, doc))
     scored_docs.sort(key=lambda item: item[0], reverse=True)
 
-    top_docs = select_top_docs(scored_docs)
+    candidate_docs = select_top_docs(scored_docs, limit=MAX_PACKED_DOCS)
     for index, (score, doc) in enumerate(scored_docs[:8], 1):
         meta = doc.metadata or {}
         preview = re.sub(r"\s+", " ", (doc.page_content or ""))[:90]
@@ -476,6 +614,9 @@ def ask_question_events(query, session):
             f"page={meta.get('page')} section={meta.get('section')} {preview!r}"
         )
 
+    history_block = _history_block(chat_history)
+    char_budget = source_char_budget(query, history_block)
+    combined_docs, top_docs = pack_context(candidate_docs, char_budget)
     citations = _build_citations(top_docs)
     source_bits = []
     for item in citations:
@@ -491,7 +632,7 @@ def ask_question_events(query, session):
         "citations": citations,
     }
 
-    combined_docs = "\n\n".join(get_answer_context(doc) for doc in top_docs)
+    history_section = f"{history_block}\n\n" if history_block else ""
     yield {
         "type": "stage",
         "id": "reasoning",
@@ -500,21 +641,19 @@ def ask_question_events(query, session):
         "citations": citations,
     }
 
-    prompt = f"""Answer the following question based strictly on the provided context. If the answer is not contained within the context, respond with "I don't know".
+    prompt = f"""Answer strictly from the numbered sources. If the sources do not contain the answer, respond with "I don't know".
 
-    Context:
-    {combined_docs}
+{history_section}Sources:
+{combined_docs}
 
-    Question: {query}
+Question: {query}
 
-    Instructions:
-    Tables are written as sentences like "Row: Header is value". Treat each Row as one complete record; do not mix values across rows.
-    Rely on explicit tables and lists before inferring answers from partial acronyms or variable names. CAP in SENSOR_CAPP is not capacitive touch.
-    If the context has a related metric but not the asked quantity or unit (for example mA when the question asks for dBm), respond with "I don't know".
-    First write a short <reasoning> of 2-4 sentences naming the pages or tables you used and why they answer the question.
-    Then put a short direct answer inside <final_answer> tags. The final answer must not include the reasoning.
+Tables are written as "Row: Header is value". Do not mix values across rows.
+Do not invent names, numbers, dates, or quotes that are not in the sources.
+First write a short <reasoning> of 2-4 sentences naming the source numbers you used.
+Then put a short direct answer inside <final_answer> tags.
 
-    Answer:"""
+Answer:"""
 
     assembled = ""
     last_detail = None
@@ -533,8 +672,7 @@ def ask_question_events(query, session):
 
     display_answer = extract_display_answer(assembled)
     reasoning = extract_reasoning(assembled)
-    chat_history.append(HumanMessage(content=query))
-    chat_history.append(AIMessage(content=display_answer))
+    _remember(chat_history, query, display_answer)
     print(f"Answer: {display_answer}")
 
     yield {
@@ -557,4 +695,3 @@ def ask_question(query, session):
                 "reasoning": event.get("reasoning") or "",
             }
     return result
- 

@@ -7,7 +7,6 @@ from functools import lru_cache
 from html.parser import HTMLParser
 
 import chromadb
-from dotenv import load_dotenv
 from unstructured.partition.pdf import partition_pdf
 from langchain_core.documents import Document
 from langchain_ollama import ChatOllama
@@ -15,14 +14,21 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
 
-load_dotenv()
+from cloak_config import (
+    EMBEDDING_MODEL_NAME,
+    ENABLE_VISION,
+    OFFLINE,
+    VISION_MODEL,
+    torch_device,
+)
 
-EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_PACK_VERSION = 1
 EXPORTABLE_METADATA_KEYS = ("source", "type", "content_hash", "page", "section")
 APPENDIX_HEADING_RE = re.compile(
     r"(?im)^\s*(appendix|annex)(\s+[a-z0-9]+)?\b"
 )
+MIN_VISION_IMAGE_BYTES = 12_000
+MIN_VISION_IMAGE_PX = 80
 
 
 def get_image_base64(image_path):
@@ -31,11 +37,24 @@ def get_image_base64(image_path):
         return base64.b64encode(image_file.read()).decode("utf-8")
 
 
-def summarize_image_with_ollama(image_path):
-    """Send the extracted image to your GTX 1060 vision model."""
-    print(f"Sending {os.path.basename(image_path)} to qwen2.5vl:7b for visual parsing...")
+def _image_worth_describing(image_path):
+    try:
+        if os.path.getsize(image_path) < MIN_VISION_IMAGE_BYTES:
+            return False
+        from PIL import Image
 
-    vision_llm = ChatOllama(model="llava", temperature=0.0)
+        with Image.open(image_path) as image:
+            width, height = image.size
+        return width >= MIN_VISION_IMAGE_PX and height >= MIN_VISION_IMAGE_PX
+    except Exception:
+        return True
+
+
+def summarize_image_with_ollama(image_path):
+    """Describe a figure with the local vision model. Never leaves the machine."""
+    print(f"Describing {os.path.basename(image_path)} with local {VISION_MODEL}...")
+
+    vision_llm = ChatOllama(model=VISION_MODEL, temperature=0.0)
     image_b64 = get_image_base64(image_path)
 
     messages = [
@@ -44,7 +63,10 @@ def summarize_image_with_ollama(image_path):
             "content": [
                 {
                     "type": "text",
-                    "text": "Describe this image, chart, or diagram in meticulous detail. Include any numbers, dimensions, or text visible in the image. This will be used in a searchable engineering database.",
+                    "text": (
+                        "Describe this image for later search. Include visible text, "
+                        "numbers, labels, and what the chart or diagram shows."
+                    ),
                 },
                 {"type": "image_url", "image_url": f"data:image/jpeg;base64,{image_b64}"},
             ],
@@ -57,10 +79,13 @@ def summarize_image_with_ollama(image_path):
 
 @lru_cache(maxsize=1)
 def get_embedding_model():
+    model_kwargs = {"device": torch_device()}
+    if OFFLINE:
+        model_kwargs["local_files_only"] = True
     return HuggingFaceEmbeddings(
         model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
+        model_kwargs=model_kwargs,
+        encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
     )
 
 
@@ -91,17 +116,19 @@ def _partition_pdf(file_path, output_image_dir):
     kwargs = dict(
         filename=file_path,
         strategy="fast",
-        extract_images_in_pdf=True,
+        extract_images_in_pdf=ENABLE_VISION,
         infer_table_structure=True,
         chunking_strategy="by_title",
         max_characters=4000,
         new_after_n_chars=3800,
         combine_text_under_n_chars=2000,
     )
-    try:
-        return partition_pdf(**kwargs, extract_image_block_output_dir=output_image_dir)
-    except TypeError:
-        return partition_pdf(**kwargs)
+    if ENABLE_VISION:
+        try:
+            return partition_pdf(**kwargs, extract_image_block_output_dir=output_image_dir)
+        except TypeError:
+            return partition_pdf(**kwargs)
+    return partition_pdf(**kwargs)
 
 
 class _HTMLTableParser(HTMLParser):
@@ -338,8 +365,8 @@ def _table_documents(tables, source_filename, content_hash, max_rows=12, appendi
     return documents
 
 
-def load_documents_with_vision(file_path, output_image_dir, source_filename=None, content_hash=None):
-    """Extract text, tables, and images; verbalize tables for a small language model."""
+def load_pdf_documents(file_path, output_image_dir, source_filename=None, content_hash=None):
+    """Extract text and tables from a PDF. Optional local vision for figures."""
     filename = source_filename or os.path.basename(file_path)
     print(f"Loading and partitioning {filename}...")
     os.makedirs(output_image_dir, exist_ok=True)
@@ -368,26 +395,52 @@ def load_documents_with_vision(file_path, output_image_dir, source_filename=None
         )
     )
 
-    for image_name in os.listdir(output_image_dir):
-        if not image_name.lower().endswith((".png", ".jpg", ".jpeg")):
-            continue
-        img_path = os.path.join(output_image_dir, image_name)
-        image_summary = summarize_image_with_ollama(img_path)
-        image_metadata = {
-            "source": filename,
-            "type": "image",
-            "image_path": img_path,
-        }
-        if content_hash:
-            image_metadata["content_hash"] = content_hash
-        all_documents.append(
-            Document(
-                page_content=f"Image Description: {image_summary}",
-                metadata=image_metadata,
+    if ENABLE_VISION:
+        described = 0
+        skipped = 0
+        for image_name in os.listdir(output_image_dir):
+            if not image_name.lower().endswith((".png", ".jpg", ".jpeg")):
+                continue
+            img_path = os.path.join(output_image_dir, image_name)
+            if not _image_worth_describing(img_path):
+                skipped += 1
+                continue
+            image_summary = summarize_image_with_ollama(img_path)
+            image_metadata = {
+                "source": filename,
+                "type": "image",
+            }
+            if content_hash:
+                image_metadata["content_hash"] = content_hash
+            all_documents.append(
+                Document(
+                    page_content=f"Image Description: {image_summary}",
+                    metadata=image_metadata,
+                )
             )
-        )
+            described += 1
+        print(f"Vision described {described} figures; skipped {skipped} tiny images.")
+    else:
+        print("Vision ingest off (CLOAK_VISION=0); text and tables only.")
 
     return all_documents
+
+
+def load_documents(file_path, output_image_dir, source_filename=None, content_hash=None):
+    """Load any supported file. More types can be added here without changing RAG."""
+    suffix = os.path.splitext(file_path)[1].lower()
+    if suffix == ".pdf":
+        return load_pdf_documents(
+            file_path,
+            output_image_dir,
+            source_filename=source_filename,
+            content_hash=content_hash,
+        )
+    raise ValueError(f"Unsupported file type: {suffix or '(none)'}")
+
+
+# Keep the old name so existing imports keep working.
+load_documents_with_vision = load_pdf_documents
 
 
 def split_documents(documents, chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]):

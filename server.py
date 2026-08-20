@@ -10,6 +10,7 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from cloak_config import describe
 from history_aware_generation import ask_question, ask_question_events
 from ingestion_pipeline import (
     add_chunks_to_vectorstore,
@@ -17,14 +18,18 @@ from ingestion_pipeline import (
     embedding_pack_is_valid,
     import_embedding_pack,
     load_chunks_from_vectorstore,
-    load_documents_with_vision,
+    load_documents,
     split_documents,
 )
 from session_manager import session_manager
 
 
+ALLOWED_SUFFIXES = {".pdf"}
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    print(describe())
     session_manager.start_sweeper()
     yield
     session_manager.shutdown()
@@ -87,8 +92,12 @@ async def upload_pdf(
 ):
     session_id = _require_session_id(x_session_id)
     original_name = file.filename or "document.pdf"
-    if not original_name.lower().endswith(".pdf"):
-        raise HTTPException(status_code=400, detail="Only PDF files are allowed.")
+    suffix = os.path.splitext(original_name)[1].lower()
+    if suffix not in ALLOWED_SUFFIXES:
+        raise HTTPException(
+            status_code=400,
+            detail="Currently only PDF files are supported. Other file types will be added later.",
+        )
 
     pack = await _read_embedding_pack(embeddings)
     session = session_manager.get_or_create(session_id)
@@ -141,7 +150,7 @@ async def upload_pdf(
                 )
 
             image_dir = os.path.join(session.temp_dir, "extracted_images", content_hash)
-            documents = load_documents_with_vision(
+            documents = load_documents(
                 file_path=file_path,
                 output_image_dir=image_dir,
                 source_filename=original_name,
