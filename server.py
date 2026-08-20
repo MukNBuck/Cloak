@@ -7,9 +7,10 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from history_aware_generation import ask_question
+from history_aware_generation import ask_question, ask_question_events
 from ingestion_pipeline import (
     add_chunks_to_vectorstore,
     collection_has_hash,
@@ -177,3 +178,20 @@ async def query_rag(
 
     with session_manager.session_scope(session_id) as session:
         return ask_question(request.query, session)
+
+
+@app.post("/query/stream")
+async def query_rag_stream(
+    request: QueryRequest,
+    x_session_id: Optional[str] = Header(default=None),
+):
+    session_id = _require_session_id(x_session_id)
+    print(f"\n--- NEW RAG STREAM QUERY RECEIVED ---")
+    print(f"Query: {request.query}")
+
+    def event_stream():
+        with session_manager.session_scope(session_id) as session:
+            for event in ask_question_events(request.query, session):
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")

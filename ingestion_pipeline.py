@@ -2,6 +2,7 @@ import os
 import math
 import base64
 import re
+from collections import defaultdict
 from functools import lru_cache
 from html.parser import HTMLParser
 
@@ -18,7 +19,10 @@ load_dotenv()
 
 EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
 EMBEDDING_PACK_VERSION = 1
-EXPORTABLE_METADATA_KEYS = ("source", "type", "content_hash", "page")
+EXPORTABLE_METADATA_KEYS = ("source", "type", "content_hash", "page", "section")
+APPENDIX_HEADING_RE = re.compile(
+    r"(?im)^\s*(appendix|annex)(\s+[a-z0-9]+)?\b"
+)
 
 
 def get_image_base64(image_path):
@@ -217,6 +221,59 @@ def _headers_from_row(row):
     return headers
 
 
+def _page_from_element(element):
+    page = getattr(getattr(element, "metadata", None), "page_number", None)
+    try:
+        return int(page) if page is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _section_from_text(text):
+    head = (text or "")[:400]
+    if APPENDIX_HEADING_RE.search(head):
+        return "appendix"
+    return None
+
+
+def _documents_from_element(element, base_metadata):
+    metadata_obj = getattr(element, "metadata", None)
+    orig = getattr(metadata_obj, "orig_elements", None) if metadata_obj else None
+    grouped = defaultdict(list)
+    if orig:
+        for sub in orig:
+            text = (getattr(sub, "text", None) or "").strip()
+            if text:
+                grouped[_page_from_element(sub)].append(text)
+    else:
+        text = (getattr(element, "text", None) or "").strip()
+        if text:
+            grouped[_page_from_element(element)].append(text)
+
+    documents = []
+    for page, parts in grouped.items():
+        text = "\n".join(parts).strip()
+        if not text:
+            continue
+        meta = dict(base_metadata)
+        if page is not None:
+            meta["page"] = page
+        section = _section_from_text(text)
+        if section:
+            meta["section"] = section
+        documents.append(Document(page_content=text, metadata=meta))
+    return documents
+
+
+def _appendix_start_page(documents):
+    pages = [
+        int(doc.metadata["page"])
+        for doc in documents
+        if doc.metadata.get("section") == "appendix" and doc.metadata.get("page") is not None
+    ]
+    return min(pages) if pages else None
+
+
 def verbalize_table(rows, source, table_index, page=None):
     headers = _headers_from_row(rows[0])
     location = f" from {source}"
@@ -234,7 +291,7 @@ def verbalize_table(rows, source, table_index, page=None):
     return "\n".join(lines)
 
 
-def _table_documents(tables, source_filename, content_hash, max_rows=12):
+def _table_documents(tables, source_filename, content_hash, max_rows=12, appendix_start=None):
     documents = []
     seen = set()
     table_index = 0
@@ -249,6 +306,11 @@ def _table_documents(tables, source_filename, content_hash, max_rows=12):
         body = rows[1:]
         if not body:
             continue
+        page = table.get("page")
+        try:
+            page = int(page) if page is not None else None
+        except (TypeError, ValueError):
+            page = None
         for start in range(0, len(body), max_rows):
             chunk_rows = headers + body[start:start + max_rows]
             metadata = {
@@ -257,15 +319,17 @@ def _table_documents(tables, source_filename, content_hash, max_rows=12):
             }
             if content_hash:
                 metadata["content_hash"] = content_hash
-            if table.get("page"):
-                metadata["page"] = int(table["page"])
+            if page is not None:
+                metadata["page"] = page
+            if appendix_start and page is not None and page >= appendix_start:
+                metadata["section"] = "appendix"
             documents.append(
                 Document(
                     page_content=verbalize_table(
                         chunk_rows,
                         source_filename,
                         table_index,
-                        page=table.get("page"),
+                        page=page,
                     ),
                     metadata=metadata,
                 )
@@ -290,21 +354,18 @@ def load_documents_with_vision(file_path, output_image_dir, source_filename=None
 
     for element in raw_pdf_elements:
         if "CompositeElement" in str(type(element)):
-            meta = dict(base_metadata)
-            page = getattr(getattr(element, "metadata", None), "page_number", None)
-            if page is not None:
-                try:
-                    meta["page"] = int(page)
-                except (TypeError, ValueError):
-                    pass
-            all_documents.append(
-                Document(page_content=element.text, metadata=meta)
-            )
+            all_documents.extend(_documents_from_element(element, base_metadata))
 
+    appendix_start = _appendix_start_page(all_documents)
     plumber_tables = _extract_tables_pdfplumber(file_path)
     unstructured_tables = _extract_tables_unstructured(raw_pdf_elements)
     all_documents.extend(
-        _table_documents(plumber_tables + unstructured_tables, filename, content_hash)
+        _table_documents(
+            plumber_tables + unstructured_tables,
+            filename,
+            content_hash,
+            appendix_start=appendix_start,
+        )
     )
 
     for image_name in os.listdir(output_image_dir):
