@@ -38,6 +38,8 @@ DEFAULT_CRAG_CANDIDATES = [
     os.getenv("CLOAK_CRAG_PATH", "").strip(),
     str(Path.home() / "data" / "crag" / "crag_task_1_and_2_dev_v4.jsonl"),
     str(Path.home() / "crag" / "crag_task_1_and_2_dev_v4.jsonl"),
+    r"C:\data\crag\crag_task_1_and_2_dev_v4.jsonl",
+    r"D:\data\crag\crag_task_1_and_2_dev_v4.jsonl",
     "/data/crag/crag_task_1_and_2_dev_v4.jsonl",
     "/opt/crag/crag_task_1_and_2_dev_v4.jsonl",
     r"e:\crag_task_1_and_2_dev_v4.jsonl\crag_task_1_and_2_dev_v4.jsonl",

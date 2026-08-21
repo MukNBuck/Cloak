@@ -1,10 +1,9 @@
 @echo off
-REM Windows helper if you stage files here before copying to the 5070 Linux box.
-REM Actual CRAG runs are meant for the 5070 machine via setup_crag_5070.sh / run_crag_5070.sh.
-
-echo Copy the Cloak folder + CRAG jsonl to the 5070 machine, then:
-echo   cd Cloak
-echo   bash setup_crag_5070.sh
-echo   bash run_crag_5070.sh smoke
+echo On the Windows 5070 machine:
+echo   1. Copy Cloak\ + crag jsonl
+echo   2. cd Cloak
+echo   3. setup_crag_5070.bat   ^(or .\setup_crag_5070.ps1^)
+echo   4. Edit .env CLOAK_CRAG_PATH
+echo   5. .\run_crag_5070.ps1 smoke
 echo See CRAG_5070.md
 pause
