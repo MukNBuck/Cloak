@@ -6,7 +6,11 @@ import time
 from contextlib import contextmanager
 
 from cloak_config import RETRIEVE_K
-from ingestion_pipeline import create_ephemeral_vectorstore, load_chunks_from_vectorstore
+from ingestion_pipeline import (
+    create_ephemeral_vectorstore,
+    delete_chunks_by_hash,
+    load_chunks_from_vectorstore,
+)
 
 IDLE_SECONDS = 30 * 60
 SWEEP_INTERVAL_SECONDS = 60
@@ -102,6 +106,46 @@ class SessionState:
             except Exception as exc:
                 print(f"BM25 rebuild failed, using vector search only: {exc}")
         self.hybrid_retriever = vector_retriever
+
+    def remove_document(self, content_hash: str) -> int:
+        """Drop a document from memory + Chroma so RAG cannot use it."""
+        if not content_hash:
+            return 0
+        before = len(self.chunks)
+        self.chunks = [
+            chunk
+            for chunk in self.chunks
+            if (chunk.metadata or {}).get("content_hash") != content_hash
+        ]
+        deleted = delete_chunks_by_hash(self.vectorstore, content_hash)
+        self.rebuild_retrievers()
+        removed = before - len(self.chunks)
+        print(
+            f"Removed document {content_hash[:12]}... "
+            f"({removed} memory chunks, {deleted} chroma rows)"
+        )
+        return removed
+
+    def sync_included_hashes(self, content_hashes) -> None:
+        """Make session chunks match the client's included-document set."""
+        if content_hashes is None:
+            return
+        allowed = {item for item in content_hashes if item}
+        present = {
+            (chunk.metadata or {}).get("content_hash")
+            for chunk in self.chunks
+            if (chunk.metadata or {}).get("content_hash")
+        }
+        for content_hash in sorted(present - allowed):
+            self.remove_document(content_hash)
+        # Never auto-hydrate the whole Chroma store when nothing is included.
+        if not self.chunks and allowed and self.vectorstore is not None:
+            for content_hash in sorted(allowed):
+                loaded = load_chunks_from_vectorstore(self.vectorstore, content_hash)
+                if loaded:
+                    self.chunks.extend(loaded)
+            if self.chunks:
+                self.rebuild_retrievers()
 
     def destroy(self):
         try:

@@ -6,6 +6,7 @@ must already be on disk; set CLOAK_OFFLINE=1 after the first cache.
 
 from functools import lru_cache
 import csv
+import json
 import os
 import sys
 
@@ -109,10 +110,75 @@ def _float(name, default):
 # Dedicated instruct model for answers. Vision stays on a separate model.
 LLM_MODEL = os.getenv("CLOAK_LLM_MODEL", "qwen2.5:7b")
 VISION_MODEL = os.getenv("CLOAK_VISION_MODEL", "qwen2.5vl:7b")
+OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", os.getenv("CLOAK_OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
 ENABLE_VISION = _flag("CLOAK_VISION", "1")
 OFFLINE = _flag("CLOAK_OFFLINE", "0")
 EMBEDDING_MODEL_NAME = os.getenv("CLOAK_EMBEDDING_MODEL", "BAAI/bge-m3")
 RERANK_MODEL = os.getenv("CLOAK_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+
+# Names that are not useful as chat/completion models in the UI dropdown.
+_EMBED_MODEL_MARKERS = (
+    "embed",
+    "embedding",
+    "bge-",
+    "e5-",
+    "gte-",
+    "minilm",
+    "nomic-embed",
+    "mxbai-embed",
+    "snowflake-arctic-embed",
+)
+
+
+def is_chat_model_name(name: str) -> bool:
+    text = (name or "").strip().lower()
+    if not text:
+        return False
+    return not any(marker in text for marker in _EMBED_MODEL_MARKERS)
+
+
+def list_ollama_models():
+    """Return installed Ollama model names suitable for chat, plus reachability."""
+    import urllib.error
+    import urllib.request
+
+    url = f"{OLLAMA_BASE_URL}/api/tags"
+    try:
+        with urllib.request.urlopen(url, timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
+        return {
+            "ok": False,
+            "error": str(exc),
+            "models": [],
+            "default": LLM_MODEL,
+            "ollama_url": OLLAMA_BASE_URL,
+        }
+
+    names = []
+    for item in payload.get("models") or []:
+        name = (item.get("name") or item.get("model") or "").strip()
+        if name and is_chat_model_name(name):
+            names.append(name)
+    # Prefer short tags without duplicate :latest clutter when both exist.
+    deduped = []
+    seen = set()
+    for name in sorted(names):
+        key = name[:-7] if name.endswith(":latest") else name
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(name)
+
+    default = LLM_MODEL if LLM_MODEL in deduped else (deduped[0] if deduped else LLM_MODEL)
+    return {
+        "ok": True,
+        "error": None,
+        "models": deduped,
+        "default": default,
+        "ollama_url": OLLAMA_BASE_URL,
+    }
+
 
 # Fetch wide so the reranker can promote a buried hit; keep only TOP_DOCS after scoring.
 RETRIEVE_K = _int("CLOAK_RETRIEVE_K", 50)

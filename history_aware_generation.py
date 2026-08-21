@@ -11,6 +11,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from collections import defaultdict
 
@@ -40,16 +41,27 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
 
-from ingestion_pipeline import load_chunks_from_vectorstore
-
 _DEVICE = torch_device()
+_llm_lock = threading.Lock()
+_llm_cache = {}
 
-llm = ChatOllama(
-    model=LLM_MODEL,
-    temperature=0.0,
-    num_ctx=NUM_CTX,
-    num_predict=NUM_PREDICT,
-)
+
+def get_llm(model_name=None):
+    name = (model_name or LLM_MODEL).strip() or LLM_MODEL
+    with _llm_lock:
+        client = _llm_cache.get(name)
+        if client is None:
+            client = ChatOllama(
+                model=name,
+                temperature=0.0,
+                num_ctx=NUM_CTX,
+                num_predict=NUM_PREDICT,
+            )
+            _llm_cache[name] = client
+        return client
+
+
+llm = get_llm(LLM_MODEL)
 
 
 class TransformersReranker:
@@ -594,15 +606,28 @@ def _identifier_boost(text_l, keys):
 
 def _retrieve(session, variation):
     try:
-        return session.hybrid_retriever.invoke(variation) or []
+        docs = session.hybrid_retriever.invoke(variation) or []
     except Exception as exc:
         print(f"Vector search failed ({exc}); using keyword search only.")
+        docs = []
         if session.bm25_retriever is not None:
             try:
-                return session.bm25_retriever.invoke(variation) or []
+                docs = session.bm25_retriever.invoke(variation) or []
             except Exception as bm25_exc:
                 print(f"BM25 search also failed: {bm25_exc}")
+                return []
+    allowed = {
+        (chunk.metadata or {}).get("content_hash")
+        for chunk in (session.chunks or [])
+        if (chunk.metadata or {}).get("content_hash")
+    }
+    if not allowed:
         return []
+    return [
+        doc
+        for doc in docs
+        if (doc.metadata or {}).get("content_hash") in allowed
+    ]
 
 
 def _rerank_scores(search_question, rerank_docs):
@@ -616,8 +641,10 @@ def _rerank_scores(search_question, rerank_docs):
 
 def _run_llm(prompt, session=None):
     assembled = []
+    model_name = getattr(session, "llm_model", None) if session is not None else None
+    client = get_llm(model_name)
     try:
-        for chunk in llm.stream(prompt):
+        for chunk in client.stream(prompt):
             if session_cancelled(session):
                 return
             piece = getattr(chunk, "content", None) or ""
@@ -629,7 +656,7 @@ def _run_llm(prompt, session=None):
         print(f"LLM stream failed, using invoke: {exc}")
     if session_cancelled(session):
         return
-    response = llm.invoke(prompt)
+    response = client.invoke(prompt)
     text = response.content or ""
     yield text, text
 
@@ -954,10 +981,6 @@ def ask_question_events(query, session):
 
     def cancelled():
         return session_cancelled(session)
-
-    if not session.chunks and session.vectorstore is not None:
-        session.chunks = load_chunks_from_vectorstore(session.vectorstore)
-        session.rebuild_retrievers()
 
     print(f"Session has {len(session.chunks)} chunks")
     if not session.chunks or session.hybrid_retriever is None:

@@ -10,7 +10,7 @@ from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from cloak_config import describe
+from cloak_config import LLM_MODEL, describe, list_ollama_models
 from history_aware_generation import ask_question, ask_question_events
 from ingestion_pipeline import (
     add_chunks_to_vectorstore,
@@ -40,6 +40,12 @@ app = FastAPI(title="Local RAG Backend API", lifespan=lifespan)
 
 class QueryRequest(BaseModel):
     query: str
+    content_hashes: Optional[list[str]] = None
+    model: Optional[str] = None
+
+
+class UnloadDocumentRequest(BaseModel):
+    content_hash: str
 
 
 def _require_session_id(x_session_id: Optional[str]) -> str:
@@ -82,6 +88,24 @@ async def close_session(x_session_id: Optional[str] = Header(default=None)):
     session_id = _require_session_id(x_session_id)
     closed = session_manager.close(session_id)
     return {"status": "closed" if closed else "already_closed", "session_id": session_id}
+
+
+@app.post("/documents/unload")
+async def unload_document(
+    request: UnloadDocumentRequest,
+    x_session_id: Optional[str] = Header(default=None),
+):
+    session_id = _require_session_id(x_session_id)
+    content_hash = (request.content_hash or "").strip()
+    if not content_hash:
+        raise HTTPException(status_code=400, detail="content_hash is required.")
+    with session_manager.session_scope(session_id) as session:
+        removed = session.remove_document(content_hash)
+    return {
+        "status": "unloaded",
+        "content_hash": content_hash,
+        "chunks_removed": removed,
+    }
 
 
 @app.post("/upload_pdf")
@@ -187,6 +211,8 @@ async def query_rag(
 
     with session_manager.session_scope(session_id) as session:
         session.cancel.clear()
+        session.sync_included_hashes(request.content_hashes)
+        session.llm_model = (request.model or "").strip() or LLM_MODEL
         return ask_question(request.query, session)
 
 
@@ -208,7 +234,29 @@ class EvalCragRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "runtime": describe()}
+    ollama = list_ollama_models()
+    return {
+        "status": "ok",
+        "runtime": describe(),
+        "ollama_ok": bool(ollama.get("ok")),
+        "ollama_url": ollama.get("ollama_url"),
+        "model_count": len(ollama.get("models") or []),
+    }
+
+
+@app.get("/models")
+async def models():
+    ollama = list_ollama_models()
+    if not ollama.get("ok"):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ollama unreachable at {ollama.get('ollama_url')}: {ollama.get('error')}",
+        )
+    return {
+        "models": ollama.get("models") or [],
+        "default": ollama.get("default") or LLM_MODEL,
+        "ollama_url": ollama.get("ollama_url"),
+    }
 
 
 @app.post("/eval/crag")
@@ -232,6 +280,9 @@ async def eval_crag_endpoint(request: EvalCragRequest):
     except Exception as exc:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/query/stream")
 async def query_rag_stream(
     request: QueryRequest,
     x_session_id: Optional[str] = Header(default=None),
@@ -243,6 +294,8 @@ async def query_rag_stream(
     def event_stream():
         with session_manager.session_scope(session_id) as session:
             session.cancel.clear()
+            session.sync_included_hashes(request.content_hashes)
+            session.llm_model = (request.model or "").strip() or LLM_MODEL
             for event in ask_question_events(request.query, session):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 

@@ -777,6 +777,29 @@ def collection_has_hash(vectorstore, content_hash):
     return len(ids) > 0
 
 
+def delete_chunks_by_hash(vectorstore, content_hash):
+    """Remove all Chroma rows for a document so vector search cannot resurrect them."""
+    if not content_hash or vectorstore is None:
+        return 0
+    try:
+        existing = vectorstore.get(where={"content_hash": content_hash})
+    except Exception as exc:
+        print(f"Failed looking up chunks for {content_hash[:12]}...: {exc}")
+        return 0
+    ids = list(_chroma_field(existing, "ids", []) or [])
+    if not ids:
+        return 0
+    try:
+        vectorstore.delete(ids=ids)
+    except Exception:
+        try:
+            vectorstore._collection.delete(ids=ids)
+        except Exception as exc:
+            print(f"Failed deleting chunks for {content_hash[:12]}...: {exc}")
+            return 0
+    return len(ids)
+
+
 def load_chunks_from_vectorstore(vectorstore, content_hash=None):
     kwargs = {"include": ["documents", "metadatas"]}
     if content_hash:
