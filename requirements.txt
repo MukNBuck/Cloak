@@ -1,4 +1,11 @@
-# Cloak RAG (eval + local FastAPI). Python 3.11–3.12 recommended.
+# Cloak RAG (eval + local FastAPI). Prefer Python 3.11 or 3.12.
+#
+# On the 5070 box, install CUDA torch FIRST (see setup_crag_5070.sh), then:
+#   pip install -r requirements.txt
+#
+# Do not rely on the plain `torch` pin below for GPU — the setup script
+# installs a CUDA wheel explicitly.
+
 python-dotenv>=1.0
 chromadb
 langchain-core
@@ -10,13 +17,13 @@ langchain-community
 langchain-ollama
 sentence-transformers
 transformers
-torch
 rank-bm25
 fastapi
 uvicorn
 pydantic
 pillow
+requests
 
-# PDF ingest only (not required for CRAG HTML eval)
+# PDF ingest (API uploads). Not required for CRAG retrieval/generate.
 pdfplumber
 unstructured[pdf]

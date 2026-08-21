@@ -234,14 +234,8 @@ class EvalCragRequest(BaseModel):
 
 @app.get("/health")
 async def health():
-    ollama = list_ollama_models()
-    return {
-        "status": "ok",
-        "runtime": describe(),
-        "ollama_ok": bool(ollama.get("ok")),
-        "ollama_url": ollama.get("ollama_url"),
-        "model_count": len(ollama.get("models") or []),
-    }
+    # Keep this cheap — the UI polls it. Do not touch Ollama here.
+    return {"status": "ok"}
 
 
 @app.get("/models")

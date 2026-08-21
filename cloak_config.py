@@ -137,23 +137,40 @@ def is_chat_model_name(name: str) -> bool:
     return not any(marker in text for marker in _EMBED_MODEL_MARKERS)
 
 
-def list_ollama_models():
+_OLLAMA_MODELS_CACHE = {"ts": 0.0, "payload": None}
+_OLLAMA_MODELS_TTL = 30.0
+
+
+def list_ollama_models(force=False):
     """Return installed Ollama model names suitable for chat, plus reachability."""
+    import time
     import urllib.error
     import urllib.request
 
+    now = time.time()
+    cached = _OLLAMA_MODELS_CACHE.get("payload")
+    if (
+        not force
+        and cached is not None
+        and (now - float(_OLLAMA_MODELS_CACHE.get("ts") or 0)) < _OLLAMA_MODELS_TTL
+    ):
+        return cached
+
     url = f"{OLLAMA_BASE_URL}/api/tags"
     try:
-        with urllib.request.urlopen(url, timeout=3) as response:
+        with urllib.request.urlopen(url, timeout=2) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (urllib.error.URLError, TimeoutError, ValueError, OSError) as exc:
-        return {
+        result = {
             "ok": False,
             "error": str(exc),
             "models": [],
             "default": LLM_MODEL,
             "ollama_url": OLLAMA_BASE_URL,
         }
+        _OLLAMA_MODELS_CACHE["ts"] = now
+        _OLLAMA_MODELS_CACHE["payload"] = result
+        return result
 
     names = []
     for item in payload.get("models") or []:
@@ -171,13 +188,16 @@ def list_ollama_models():
         deduped.append(name)
 
     default = LLM_MODEL if LLM_MODEL in deduped else (deduped[0] if deduped else LLM_MODEL)
-    return {
+    result = {
         "ok": True,
         "error": None,
         "models": deduped,
         "default": default,
         "ollama_url": OLLAMA_BASE_URL,
     }
+    _OLLAMA_MODELS_CACHE["ts"] = now
+    _OLLAMA_MODELS_CACHE["payload"] = result
+    return result
 
 
 # Fetch wide so the reranker can promote a buried hit; keep only TOP_DOCS after scoring.

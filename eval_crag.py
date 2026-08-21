@@ -34,10 +34,29 @@ from collections import defaultdict
 from html.parser import HTMLParser
 from pathlib import Path
 
-DEFAULT_CRAG_PATH = os.getenv(
-    "CLOAK_CRAG_PATH",
+DEFAULT_CRAG_CANDIDATES = [
+    os.getenv("CLOAK_CRAG_PATH", "").strip(),
+    str(Path.home() / "data" / "crag" / "crag_task_1_and_2_dev_v4.jsonl"),
+    str(Path.home() / "crag" / "crag_task_1_and_2_dev_v4.jsonl"),
+    "/data/crag/crag_task_1_and_2_dev_v4.jsonl",
+    "/opt/crag/crag_task_1_and_2_dev_v4.jsonl",
     r"e:\crag_task_1_and_2_dev_v4.jsonl\crag_task_1_and_2_dev_v4.jsonl",
-)
+]
+
+
+def resolve_crag_path(explicit: str | None = None) -> str:
+    candidates = []
+    if explicit:
+        candidates.append(explicit)
+    candidates.extend(path for path in DEFAULT_CRAG_CANDIDATES if path)
+    for path in candidates:
+        if Path(path).exists():
+            return str(Path(path))
+    return candidates[0] if candidates else ""
+
+
+DEFAULT_CRAG_PATH = resolve_crag_path()
+
 def _out(text):
     text = str(text)
     try:
@@ -436,7 +455,7 @@ def run_eval(
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Evaluate Cloak against CRAG jsonl")
-    parser.add_argument("--path", default=DEFAULT_CRAG_PATH)
+    parser.add_argument("--path", default=None, help="CRAG jsonl path (or set CLOAK_CRAG_PATH)")
     parser.add_argument("--limit", type=int, default=40)
     parser.add_argument(
         "--mode",
@@ -452,8 +471,14 @@ def main(argv=None):
     )
     parser.add_argument("--out", default="", help="Write JSON results to this path")
     args = parser.parse_args(argv)
+    path = resolve_crag_path(args.path)
+    if not path or not Path(path).exists():
+        raise SystemExit(
+            "CRAG jsonl not found. Copy crag_task_1_and_2_dev_v4.jsonl onto this machine "
+            "and either pass --path /path/to/file.jsonl or export CLOAK_CRAG_PATH."
+        )
     result = run_eval(
-        path=args.path,
+        path=path,
         limit=args.limit,
         mode=args.mode,
         split=args.split,
