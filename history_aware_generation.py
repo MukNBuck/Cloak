@@ -8,6 +8,7 @@ Query flow:
 """
 
 import json
+import math
 import re
 from collections import defaultdict
 
@@ -28,6 +29,8 @@ from cloak_config import (
     OFFLINE,
     PROMPT_RESERVE_TOKENS,
     RERANK_CANDIDATES,
+    RERANK_MAX_CHARS,
+    RERANK_MIN_SCORE,
     RERANK_MODEL,
     TOP_DOCS,
     torch_device,
@@ -67,6 +70,23 @@ STOPWORDS = frozenset(
     were what when where which who why with would you your
     """.split()
 )
+
+
+def _sigmoid(score):
+    value = float(score)
+    if value >= 0:
+        return 1.0 / (1.0 + math.exp(-value))
+    exp = math.exp(value)
+    return exp / (1.0 + exp)
+
+
+def _rerank_text(doc):
+    """Cross-encoders cap around 512 tokens; score the head of the chunk, not a truncated tail."""
+    text = doc.page_content or ""
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) <= RERANK_MAX_CHARS:
+        return text
+    return text[:RERANK_MAX_CHARS].rsplit(" ", 1)[0]
 
 
 def _tokens(text):
@@ -388,21 +408,22 @@ def select_top_docs(scored_docs, limit=None, per_page=2):
     limit = limit or TOP_DOCS
     picked = []
     page_counts = defaultdict(int)
-    for _score, doc in scored_docs:
+    for item in scored_docs:
+        doc = item[1]
         page = (doc.metadata or {}).get("page")
         key = page if page is not None else id(doc)
         if page_counts[key] >= per_page:
             continue
-        picked.append(doc)
+        picked.append(item)
         page_counts[key] += 1
         if len(picked) >= limit:
             break
     if len(picked) < limit:
-        seen = {id(doc) for doc in picked}
-        for _score, doc in scored_docs:
-            if id(doc) in seen:
+        seen = {id(item[1]) for item in picked}
+        for item in scored_docs:
+            if id(item[1]) in seen:
                 continue
-            picked.append(doc)
+            picked.append(item)
             if len(picked) >= limit:
                 break
     return picked
@@ -456,8 +477,9 @@ def _stopped(citations=None):
     return _complete("Stopped.", citations)
 
 
-def _build_citations(top_docs):
+def _build_citations(top_docs, scores=None):
     citations = []
+    scores = scores or {}
     for index, doc in enumerate(top_docs, 1):
         meta = doc.metadata or {}
         page = meta.get("page")
@@ -466,29 +488,35 @@ def _build_citations(top_docs):
         except (TypeError, ValueError):
             page = None
         excerpt = citation_excerpt(doc)
+        raw_score, confidence = scores.get(id(doc), (None, None))
         print(f"Citation {index}: {meta.get('source')} p.{page} {meta.get('type')} {excerpt[:80]!r}")
-        citations.append(
-            {
-                "id": index,
-                "source": meta.get("source") or "document.pdf",
-                "content_hash": meta.get("content_hash") or "",
-                "type": meta.get("type") or "text",
-                "page": page,
-                "excerpt": excerpt,
-            }
-        )
+        item = {
+            "id": index,
+            "source": meta.get("source") or "document.pdf",
+            "content_hash": meta.get("content_hash") or "",
+            "type": meta.get("type") or "text",
+            "page": page,
+            "excerpt": excerpt,
+        }
+        if raw_score is not None:
+            item["rerank_score"] = round(float(raw_score), 4)
+            item["rerank_confidence"] = round(float(confidence), 4)
+        citations.append(item)
     return citations
 
 
-def _complete(answer, citations=None):
+def _complete(answer, citations=None, extra=None):
     citations = citations or []
-    return {
+    payload = {
         "type": "complete",
         "answer": answer,
         "context": [item.get("excerpt") or "" for item in citations],
         "citations": citations,
         "reasoning": "",
     }
+    if extra:
+        payload.update(extra)
+    return payload
 
 
 def _trim_history(chat_history):
@@ -526,7 +554,7 @@ def _retrieve(session, variation):
 
 
 def _rerank_scores(search_question, rerank_docs):
-    pairs = [[search_question, doc.page_content] for doc in rerank_docs]
+    pairs = [[search_question, _rerank_text(doc)] for doc in rerank_docs]
     try:
         return reranker.predict(pairs)
     except Exception as exc:
@@ -654,6 +682,7 @@ def ask_question_events(query, session):
     print("Reranking fused candidates with cross-encoder...")
     rerank_docs = fused_docs[:RERANK_CANDIDATES]
     scores = _rerank_scores(search_question, rerank_docs)
+    raw_by_id = {}
     question_l = search_question.lower()
     keys = _strict_terms(search_question)
     wants_appendix = "appendix" in question_l or "annex" in question_l
@@ -661,7 +690,9 @@ def ask_question_events(query, session):
     appendix_start = None if wants_appendix else appendix_start_page(session.chunks)
     scored_docs = []
     for score, doc in zip(scores, rerank_docs):
-        adjusted = float(score)
+        raw = float(score)
+        raw_by_id[id(doc)] = raw
+        adjusted = raw
         text_l = (doc.page_content or "").lower()
         adjusted += _identifier_boost(text_l, keys)
         if boost_tables and doc.metadata.get("type") == "table":
@@ -671,36 +702,85 @@ def ask_question_events(query, session):
         scored_docs.append((adjusted, doc))
     scored_docs.sort(key=lambda item: item[0], reverse=True)
 
-    candidate_docs = select_top_docs(scored_docs, limit=MAX_PACKED_DOCS)
-    for index, (score, doc) in enumerate(scored_docs[:8], 1):
+    ranked = select_top_docs(scored_docs, limit=TOP_DOCS)
+    score_map = {}
+    for _adjusted, doc in ranked:
+        raw = raw_by_id.get(id(doc), 0.0)
+        score_map[id(doc)] = (raw, _sigmoid(raw))
+    for index, (adjusted, doc) in enumerate(scored_docs[:8], 1):
         meta = doc.metadata or {}
+        raw, confidence = score_map.get(id(doc), (raw_by_id.get(id(doc), 0.0), 0.0))
+        if id(doc) not in score_map:
+            confidence = _sigmoid(raw)
         preview = re.sub(r"\s+", " ", (doc.page_content or ""))[:90]
         print(
-            f"  rank {index}: score={score:.3f} type={meta.get('type')} "
-            f"page={meta.get('page')} section={meta.get('section')} {preview!r}"
+            f"  rank {index}: logit={raw:.3f} conf={confidence:.3f} adj={adjusted:.3f} "
+            f"type={meta.get('type')} page={meta.get('page')} "
+            f"section={meta.get('section')} {preview!r}"
         )
 
-    if cancelled():
-        yield _stopped()
-        return
-
-    history_block = _history_block(chat_history)
-    char_budget = source_char_budget(query, history_block)
-    combined_docs, top_docs = pack_context(candidate_docs, char_budget)
-    citations = _build_citations(top_docs)
+    source_docs = [doc for _adjusted, doc in ranked]
+    passing = [
+        doc for doc in source_docs
+        if score_map.get(id(doc), (0.0, 0.0))[1] >= RERANK_MIN_SCORE
+    ]
+    top_confidence = max((score_map[id(doc)][1] for doc in source_docs), default=0.0)
+    citations = _build_citations(source_docs, score_map)
     source_bits = []
     for item in citations:
         bit = item.get("source") or "document.pdf"
         if item.get("page"):
             bit += f" p.{item['page']}"
+        if item.get("rerank_confidence") is not None:
+            bit += f" ({item['rerank_confidence']:.2f})"
         source_bits.append(bit)
     yield {
         "type": "stage",
         "id": "reranking",
         "label": "Reranking sources",
-        "detail": f"Using {len(citations)} sources · {', '.join(source_bits[:3])}",
+        "detail": (
+            f"Top {len(citations)} · best conf {top_confidence:.2f} "
+            f"(min {RERANK_MIN_SCORE:.2f}) · {', '.join(source_bits[:3])}"
+        ),
         "citations": citations,
     }
+
+    if cancelled():
+        yield _stopped(citations)
+        return
+
+    confidence_extra = {
+        "rerank_confidence": round(float(top_confidence), 4),
+        "rerank_min_score": RERANK_MIN_SCORE,
+        "rerank_passed": bool(passing),
+    }
+
+    if not passing:
+        answer = "I don't know"
+        _remember(chat_history, query, answer)
+        print(
+            f"Rerank confidence {top_confidence:.3f} < {RERANK_MIN_SCORE:.3f}; "
+            "skipping generation."
+        )
+        print(f"Answer: {answer}")
+        yield _complete(answer, citations, confidence_extra)
+        return
+
+    history_block = _history_block(chat_history)
+    char_budget = source_char_budget(query, history_block)
+    combined_docs, top_docs = pack_context(passing[:MAX_PACKED_DOCS], char_budget)
+    citations = _build_citations(top_docs, score_map)
+    yield {
+        "type": "stage",
+        "id": "reranking",
+        "label": "Reranking sources",
+        "detail": f"Using {len(citations)} sources above {RERANK_MIN_SCORE:.2f}",
+        "citations": citations,
+    }
+
+    if cancelled():
+        yield _stopped(citations)
+        return
 
     history_section = f"{history_block}\n\n" if history_block else ""
     yield {
@@ -746,6 +826,8 @@ Answer:"""
         "context": [item["excerpt"] for item in citations],
         "citations": citations,
         "reasoning": reasoning,
+        **confidence_extra,
+        "rerank_passed": True,
     }
 
 
@@ -758,5 +840,8 @@ def ask_question(query, session):
                 "context": event.get("context") or [],
                 "citations": event.get("citations") or [],
                 "reasoning": event.get("reasoning") or "",
+                "rerank_confidence": event.get("rerank_confidence"),
+                "rerank_min_score": event.get("rerank_min_score"),
+                "rerank_passed": event.get("rerank_passed"),
             }
     return result

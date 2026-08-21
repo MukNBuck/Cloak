@@ -26,16 +26,28 @@ def _int(name, default):
         return default
 
 
+def _float(name, default):
+    try:
+        return float(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+
+
 LLM_MODEL = os.getenv("CLOAK_LLM_MODEL", "llava")
 VISION_MODEL = os.getenv("CLOAK_VISION_MODEL", LLM_MODEL)
 ENABLE_VISION = _flag("CLOAK_VISION", "0")
 OFFLINE = _flag("CLOAK_OFFLINE", "0")
 EMBEDDING_MODEL_NAME = os.getenv("CLOAK_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
 RERANK_MODEL = os.getenv("CLOAK_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
-RETRIEVE_K = _int("CLOAK_RETRIEVE_K", 12)
-RERANK_CANDIDATES = _int("CLOAK_RERANK_CANDIDATES", 12)
+# Fetch wide so the reranker can promote a buried hit; keep only TOP_DOCS after scoring.
+RETRIEVE_K = _int("CLOAK_RETRIEVE_K", 24)
+RERANK_CANDIDATES = _int("CLOAK_RERANK_CANDIDATES", 24)
 TOP_DOCS = _int("CLOAK_TOP_DOCS", 3)
-MAX_PACKED_DOCS = _int("CLOAK_MAX_PACKED_DOCS", 10)
+MAX_PACKED_DOCS = _int("CLOAK_MAX_PACKED_DOCS", TOP_DOCS)
+# MiniLM/BGE logits mapped through sigmoid. Below this, skip generation.
+RERANK_MIN_SCORE = _float("CLOAK_RERANK_MIN_SCORE", 0.35)
+# Cross-encoders typically truncate at 512 tokens; don't score a 4k chunk blindly.
+RERANK_MAX_CHARS = _int("CLOAK_RERANK_MAX_CHARS", 1800)
 NUM_CTX = _int("CLOAK_NUM_CTX", 4096)
 NUM_PREDICT = _int("CLOAK_NUM_PREDICT", 384)
 PROMPT_RESERVE_TOKENS = _int("CLOAK_PROMPT_RESERVE_TOKENS", 280)
@@ -79,6 +91,7 @@ def torch_device():
 def describe():
     return (
         f"Cloak local RAG  llm={LLM_MODEL}  embeddings={EMBEDDING_MODEL_NAME}  "
-        f"device={torch_device()}  ctx={NUM_CTX}  vision={'on' if ENABLE_VISION else 'off'}  "
+        f"device={torch_device()}  ctx={NUM_CTX}  top={TOP_DOCS}  "
+        f"rerank_min={RERANK_MIN_SCORE}  vision={'on' if ENABLE_VISION else 'off'}  "
         f"offline={'on' if OFFLINE else 'off'}"
     )
