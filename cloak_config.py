@@ -5,7 +5,21 @@ must already be on disk; set CLOAK_OFFLINE=1 after the first cache.
 """
 
 from functools import lru_cache
+import csv
 import os
+import sys
+
+# Python 3.14: transformers -> importlib.metadata.packages_distributions()
+# parses dist-info RECORD as CSV and dies on fields > 131072.
+_limit = sys.maxsize
+while True:
+    try:
+        csv.field_size_limit(_limit)
+        break
+    except OverflowError:
+        _limit = min(_limit, 2**31 - 1) // 2
+        if _limit < 131072:
+            break
 
 from dotenv import load_dotenv
 
@@ -13,6 +27,65 @@ load_dotenv()
 
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
+
+
+def _stub_sklearn_if_scipy_broken():
+    """Python 3.14 scipy wheels can ship NUL-corrupted sources.
+
+    transformers still imports sklearn/scipy at module load even for encoder-only
+    BGE models. Stub the symbols so embed/rerank can import.
+    """
+    import importlib.machinery
+    import types
+
+    def _broken(modname):
+        try:
+            __import__(modname)
+            return False
+        except Exception:
+            return True
+
+    if not _broken("scipy.sparse") and not _broken("scipy.optimize"):
+        return
+
+    def _mod(name, package=False):
+        module = types.ModuleType(name)
+        spec = importlib.machinery.ModuleSpec(name, loader=None, is_package=package)
+        if package:
+            module.__path__ = []
+            spec.submodule_search_locations = []
+        module.__spec__ = spec
+        module.__file__ = f"<cloak-stub:{name}>"
+        sys.modules[name] = module
+        return module
+
+    def _unavailable(*_args, **_kwargs):
+        raise RuntimeError("scipy/sklearn is stubbed because scipy is unusable on this Python")
+
+    scipy = sys.modules.get("scipy")
+    if scipy is None or getattr(scipy, "__spec__", None) is None:
+        scipy = _mod("scipy", package=True)
+
+    sparse = _mod("scipy.sparse", package=True)
+    optimize = _mod("scipy.optimize", package=True)
+    stats = _mod("scipy.stats", package=True)
+    sparse.issparse = lambda *_a, **_k: False
+    sparse.csr_array = _unavailable
+    sparse.csr_matrix = _unavailable
+    optimize.linear_sum_assignment = _unavailable
+    stats.fisher_exact = _unavailable
+    scipy.sparse = sparse
+    scipy.optimize = optimize
+    scipy.stats = stats
+
+    sklearn = _mod("sklearn", package=True)
+    metrics = _mod("sklearn.metrics", package=True)
+    metrics.roc_curve = _unavailable
+    sklearn.metrics = metrics
+    print("scipy is broken; stubbed scipy/sklearn so BGE embed/rerank can load.")
+
+
+_stub_sklearn_if_scipy_broken()
 
 
 def _flag(name, default="0"):
@@ -33,29 +106,44 @@ def _float(name, default):
         return default
 
 
-LLM_MODEL = os.getenv("CLOAK_LLM_MODEL", "llava")
-VISION_MODEL = os.getenv("CLOAK_VISION_MODEL", LLM_MODEL)
-ENABLE_VISION = _flag("CLOAK_VISION", "0")
+# Dedicated instruct model for answers. Vision stays on a separate model.
+LLM_MODEL = os.getenv("CLOAK_LLM_MODEL", "qwen2.5:7b")
+VISION_MODEL = os.getenv("CLOAK_VISION_MODEL", "qwen2.5vl:7b")
+ENABLE_VISION = _flag("CLOAK_VISION", "1")
 OFFLINE = _flag("CLOAK_OFFLINE", "0")
-EMBEDDING_MODEL_NAME = os.getenv("CLOAK_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
-RERANK_MODEL = os.getenv("CLOAK_RERANK_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2")
+EMBEDDING_MODEL_NAME = os.getenv("CLOAK_EMBEDDING_MODEL", "BAAI/bge-m3")
+RERANK_MODEL = os.getenv("CLOAK_RERANK_MODEL", "BAAI/bge-reranker-v2-m3")
+
 # Fetch wide so the reranker can promote a buried hit; keep only TOP_DOCS after scoring.
-RETRIEVE_K = _int("CLOAK_RETRIEVE_K", 24)
-RERANK_CANDIDATES = _int("CLOAK_RERANK_CANDIDATES", 24)
+RETRIEVE_K = _int("CLOAK_RETRIEVE_K", 50)
+RERANK_CANDIDATES = _int("CLOAK_RERANK_CANDIDATES", 50)
 TOP_DOCS = _int("CLOAK_TOP_DOCS", 3)
 MAX_PACKED_DOCS = _int("CLOAK_MAX_PACKED_DOCS", TOP_DOCS)
-# MiniLM/BGE logits mapped through sigmoid. Below this, skip generation.
+EXTRACT_TOP_DOCS = _int("CLOAK_EXTRACT_TOP_DOCS", 5)
+COMPARE_TOP_PER_SIDE = _int("CLOAK_COMPARE_TOP_PER_SIDE", 2)
+SUMMARIZE_MAP_CHUNKS = _int("CLOAK_SUMMARIZE_MAP_CHUNKS", 16)
+AGENT_RETRIES = _int("CLOAK_AGENT_RETRIES", 1)
+
+# MiniLM/BGE logits mapped through sigmoid. Below this, skip generation
+# unless a retry produces a passing hit.
 RERANK_MIN_SCORE = _float("CLOAK_RERANK_MIN_SCORE", 0.35)
-# Cross-encoders typically truncate at 512 tokens; don't score a 4k chunk blindly.
 RERANK_MAX_CHARS = _int("CLOAK_RERANK_MAX_CHARS", 1800)
-NUM_CTX = _int("CLOAK_NUM_CTX", 4096)
-NUM_PREDICT = _int("CLOAK_NUM_PREDICT", 384)
-PROMPT_RESERVE_TOKENS = _int("CLOAK_PROMPT_RESERVE_TOKENS", 280)
-MAX_CHUNK_CHARS = _int("CLOAK_MAX_CHUNK_CHARS", 900)
+
+NUM_CTX = _int("CLOAK_NUM_CTX", 16384)
+NUM_PREDICT = _int("CLOAK_NUM_PREDICT", 1024)
+PROMPT_RESERVE_TOKENS = _int("CLOAK_PROMPT_RESERVE_TOKENS", 400)
+# Parent page text sent to the LLM (small-to-big).
+MAX_CHUNK_CHARS = _int("CLOAK_MAX_CHUNK_CHARS", 2800)
+PARENT_TEXT_CHARS = _int("CLOAK_PARENT_TEXT_CHARS", 8000)
 # 0 = fill leftover window automatically. Set a positive cap to override.
 MAX_CONTEXT_CHARS = _int("CLOAK_MAX_CONTEXT_CHARS", 0)
 HISTORY_MESSAGES = _int("CLOAK_HISTORY_MESSAGES", 8)
 CHARS_PER_TOKEN = 3.5
+
+# auto = try hi_res, then ocr_only, then fast.
+PDF_PARSE_STRATEGY = os.getenv("CLOAK_PDF_STRATEGY", "auto").strip().lower() or "auto"
+CHILD_CHUNK_SIZE = _int("CLOAK_CHILD_CHUNK_SIZE", 480)
+CHILD_CHUNK_OVERLAP = _int("CLOAK_CHILD_CHUNK_OVERLAP", 80)
 
 if OFFLINE:
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -90,8 +178,10 @@ def torch_device():
 
 def describe():
     return (
-        f"Cloak local RAG  llm={LLM_MODEL}  embeddings={EMBEDDING_MODEL_NAME}  "
+        f"Cloak local RAG  llm={LLM_MODEL}  vision={VISION_MODEL}  "
+        f"embeddings={EMBEDDING_MODEL_NAME}  rerank={RERANK_MODEL}  "
         f"device={torch_device()}  ctx={NUM_CTX}  top={TOP_DOCS}  "
-        f"rerank_min={RERANK_MIN_SCORE}  vision={'on' if ENABLE_VISION else 'off'}  "
+        f"rerank_min={RERANK_MIN_SCORE}  pdf={PDF_PARSE_STRATEGY}  "
+        f"vision={'on' if ENABLE_VISION else 'off'}  "
         f"offline={'on' if OFFLINE else 'off'}"
     )

@@ -197,7 +197,41 @@ async def cancel_query(x_session_id: Optional[str] = Header(default=None)):
     return {"status": "cancelling" if cancelled else "idle", "session_id": session_id}
 
 
-@app.post("/query/stream")
+class EvalCragRequest(BaseModel):
+    path: Optional[str] = None
+    limit: int = 40
+    mode: str = "retrieval"
+    split: int = 0
+    html: bool = False
+    seed: int = 0
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "runtime": describe()}
+
+
+@app.post("/eval/crag")
+async def eval_crag_endpoint(request: EvalCragRequest):
+    from eval_crag import DEFAULT_CRAG_PATH, run_eval
+
+    mode = (request.mode or "retrieval").strip().lower()
+    if mode not in {"corpus", "retrieval", "generate"}:
+        raise HTTPException(status_code=400, detail="mode must be corpus, retrieval, or generate")
+    try:
+        return run_eval(
+            path=request.path or DEFAULT_CRAG_PATH,
+            limit=max(1, min(request.limit, 200)),
+            mode=mode,
+            split=request.split,
+            seed=request.seed,
+            html=request.html,
+        )
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 async def query_rag_stream(
     request: QueryRequest,
     x_session_id: Optional[str] = Header(default=None),

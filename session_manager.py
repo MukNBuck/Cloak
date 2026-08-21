@@ -5,9 +5,6 @@ import threading
 import time
 from contextlib import contextmanager
 
-from langchain_classic.retrievers import EnsembleRetriever
-from langchain_community.retrievers import BM25Retriever
-
 from cloak_config import RETRIEVE_K
 from ingestion_pipeline import create_ephemeral_vectorstore, load_chunks_from_vectorstore
 
@@ -17,6 +14,52 @@ SWEEP_INTERVAL_SECONDS = 60
 
 def _bm25_tokens(text):
     return re.findall(r"[a-z0-9][a-z0-9_./+-]*", (text or "").lower())
+
+
+class LocalBM25Retriever:
+    """Okapi BM25 without langchain_community (avoids nltk/scipy on this Python)."""
+
+    def __init__(self, documents, k=50):
+        from rank_bm25 import BM25Okapi
+
+        self.docs = list(documents)
+        self.k = k
+        self._bm25 = BM25Okapi([_bm25_tokens(doc.page_content) for doc in self.docs])
+
+    def invoke(self, query):
+        if not self.docs:
+            return []
+        scores = self._bm25.get_scores(_bm25_tokens(query or ""))
+        ranked = sorted(range(len(self.docs)), key=lambda i: scores[i], reverse=True)
+        return [self.docs[i] for i in ranked[: self.k]]
+
+
+class HybridRetriever:
+    """Weighted reciprocal rank fusion of BM25 + vector ranks."""
+
+    def __init__(self, retrievers, weights=None, k=50, rrf_k=60):
+        self.retrievers = retrievers
+        self.weights = weights or [1.0 / max(len(retrievers), 1)] * len(retrievers)
+        self.k = k
+        self.rrf_k = rrf_k
+
+    def invoke(self, query):
+        fused = {}
+        order = []
+        for retriever, weight in zip(self.retrievers, self.weights):
+            try:
+                docs = retriever.invoke(query) or []
+            except Exception as exc:
+                print(f"Hybrid branch failed ({exc})")
+                docs = []
+            for rank, doc in enumerate(docs):
+                key = id(doc)
+                if key not in fused:
+                    fused[key] = [0.0, doc]
+                    order.append(key)
+                fused[key][0] += float(weight) / (self.rrf_k + rank + 1)
+        ranked = sorted(order, key=lambda key: fused[key][0], reverse=True)
+        return [fused[key][1] for key in ranked[: self.k]]
 
 
 class SessionState:
@@ -48,15 +91,12 @@ class SessionState:
         self.bm25_retriever = None
         if usable:
             try:
-                bm25_retriever = BM25Retriever.from_documents(
-                    usable,
-                    preprocess_func=_bm25_tokens,
-                )
-                bm25_retriever.k = RETRIEVE_K
+                bm25_retriever = LocalBM25Retriever(usable, k=RETRIEVE_K)
                 self.bm25_retriever = bm25_retriever
-                self.hybrid_retriever = EnsembleRetriever(
+                self.hybrid_retriever = HybridRetriever(
                     retrievers=[bm25_retriever, vector_retriever],
                     weights=[0.55, 0.45],
+                    k=RETRIEVE_K,
                 )
                 return
             except Exception as exc:

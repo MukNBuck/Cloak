@@ -1,29 +1,42 @@
 import os
 import math
+import json
 import base64
 import re
 from collections import defaultdict
 from functools import lru_cache
 from html.parser import HTMLParser
 
-import chromadb
-from unstructured.partition.pdf import partition_pdf
-from langchain_core.documents import Document
-from langchain_ollama import ChatOllama
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_huggingface import HuggingFaceEmbeddings
-from langchain_chroma import Chroma
-
 from cloak_config import (
+    CHILD_CHUNK_OVERLAP,
+    CHILD_CHUNK_SIZE,
     EMBEDDING_MODEL_NAME,
     ENABLE_VISION,
     OFFLINE,
+    PARENT_TEXT_CHARS,
+    PDF_PARSE_STRATEGY,
     VISION_MODEL,
     torch_device,
 )
 
+import chromadb
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_ollama import ChatOllama
+from langchain_chroma import Chroma
+
 EMBEDDING_PACK_VERSION = 1
-EXPORTABLE_METADATA_KEYS = ("source", "type", "content_hash", "page", "section")
+EXPORTABLE_METADATA_KEYS = (
+    "source",
+    "type",
+    "content_hash",
+    "page",
+    "section",
+    "heading",
+    "parent_id",
+    "parent_text",
+    "original_content",
+)
 APPENDIX_HEADING_RE = re.compile(
     r"(?im)^\s*(appendix|annex)(\s+[a-z0-9]+)?\b"
 )
@@ -74,19 +87,60 @@ def summarize_image_with_ollama(image_path):
     ]
 
     response = vision_llm.invoke(messages)
-    return response.content
+    return (response.content or "").strip()
+
+
+class TransformersEmbeddings(Embeddings):
+    """Dense embeddings via transformers only (no sentence-transformers/scipy)."""
+
+    def __init__(self, model_name, device="cpu", max_length=1024, batch_size=8):
+        import torch
+        from transformers import AutoModel, AutoTokenizer
+
+        kwargs = {}
+        if OFFLINE:
+            kwargs["local_files_only"] = True
+        self.torch = torch
+        self.device = device
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+        self.model = AutoModel.from_pretrained(model_name, **kwargs)
+        self.model.to(device)
+        self.model.eval()
+
+    def _encode(self, texts):
+        vectors = []
+        torch = self.torch
+        for start in range(0, len(texts), self.batch_size):
+            batch = [text or "" for text in texts[start : start + self.batch_size]]
+            encoded = self.tokenizer(
+                batch,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(self.device) for key, value in encoded.items()}
+            with torch.no_grad():
+                hidden = self.model(**encoded).last_hidden_state
+                mask = encoded["attention_mask"].unsqueeze(-1).type_as(hidden)
+                pooled = (hidden * mask).sum(1) / mask.sum(1).clamp(min=1e-6)
+                pooled = torch.nn.functional.normalize(pooled, p=2, dim=1)
+            vectors.extend(pooled.cpu().tolist())
+        return vectors
+
+    def embed_documents(self, texts):
+        return self._encode(list(texts))
+
+    def embed_query(self, text):
+        return self._encode([text or ""])[0]
 
 
 @lru_cache(maxsize=1)
 def get_embedding_model():
-    model_kwargs = {"device": torch_device()}
-    if OFFLINE:
-        model_kwargs["local_files_only"] = True
-    return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs=model_kwargs,
-        encode_kwargs={"normalize_embeddings": True, "batch_size": 32},
-    )
+    print(f"Loading embeddings {EMBEDDING_MODEL_NAME} on {torch_device()}...")
+    return TransformersEmbeddings(EMBEDDING_MODEL_NAME, device=torch_device())
 
 
 def create_ephemeral_vectorstore(collection_name="rag_collection"):
@@ -112,23 +166,50 @@ def _clean_metadata(metadata):
     return cleaned
 
 
+def _pdf_strategies():
+    requested = PDF_PARSE_STRATEGY
+    if requested in ("hi_res", "ocr_only", "fast"):
+        fallbacks = [s for s in ("hi_res", "ocr_only", "fast") if s != requested]
+        return [requested] + fallbacks
+    return ["hi_res", "ocr_only", "fast"]
+
+
 def _partition_pdf(file_path, output_image_dir):
-    kwargs = dict(
-        filename=file_path,
-        strategy="fast",
-        extract_images_in_pdf=ENABLE_VISION,
-        infer_table_structure=True,
-        chunking_strategy="by_title",
-        max_characters=4000,
-        new_after_n_chars=3800,
-        combine_text_under_n_chars=2000,
-    )
-    if ENABLE_VISION:
+    """Layout-aware parse with OCR fallback. Never fail the import on a missing model."""
+    try:
+        from unstructured.partition.pdf import partition_pdf
+    except ImportError as exc:
+        raise ImportError(
+            "PDF ingest needs the unstructured package. "
+            "Install with: py -3 -m pip install \"unstructured[pdf]\" pdfplumber"
+        ) from exc
+    last_error = None
+    for strategy in _pdf_strategies():
+        kwargs = dict(
+            filename=file_path,
+            strategy=strategy,
+            extract_images_in_pdf=ENABLE_VISION,
+            infer_table_structure=True,
+        )
+        print(f"Partitioning PDF with strategy={strategy}...")
         try:
-            return partition_pdf(**kwargs, extract_image_block_output_dir=output_image_dir)
-        except TypeError:
-            return partition_pdf(**kwargs)
-    return partition_pdf(**kwargs)
+            if ENABLE_VISION:
+                try:
+                    elements = partition_pdf(
+                        **kwargs, extract_image_block_output_dir=output_image_dir
+                    )
+                except TypeError:
+                    elements = partition_pdf(**kwargs)
+            else:
+                elements = partition_pdf(**kwargs)
+            print(f"PDF strategy={strategy} produced {len(elements or [])} elements.")
+            return elements or []
+        except Exception as exc:
+            last_error = exc
+            print(f"PDF strategy={strategy} failed ({exc}); trying next.")
+    if last_error:
+        print(f"All PDF strategies failed; last error: {last_error}")
+    return []
 
 
 class _HTMLTableParser(HTMLParser):
@@ -267,15 +348,23 @@ def _documents_from_element(element, base_metadata):
     metadata_obj = getattr(element, "metadata", None)
     orig = getattr(metadata_obj, "orig_elements", None) if metadata_obj else None
     grouped = defaultdict(list)
+    headings = {}
     if orig:
         for sub in orig:
             text = (getattr(sub, "text", None) or "").strip()
-            if text:
-                grouped[_page_from_element(sub)].append(text)
+            if not text:
+                continue
+            page = _page_from_element(sub)
+            grouped[page].append(text)
+            if "Title" in type(sub).__name__ and page not in headings:
+                headings[page] = text[:200]
     else:
         text = (getattr(element, "text", None) or "").strip()
         if text:
-            grouped[_page_from_element(element)].append(text)
+            page = _page_from_element(element)
+            grouped[page].append(text)
+            if "Title" in type(element).__name__:
+                headings[page] = text[:200]
 
     documents = []
     for page, parts in grouped.items():
@@ -285,11 +374,78 @@ def _documents_from_element(element, base_metadata):
         meta = dict(base_metadata)
         if page is not None:
             meta["page"] = page
+        heading = headings.get(page)
+        if heading:
+            meta["heading"] = heading
         section = _section_from_text(text)
         if section:
             meta["section"] = section
         documents.append(Document(page_content=text, metadata=meta))
     return documents
+
+
+def _documents_from_pdf_elements(elements, base_metadata):
+    """Group raw unstructured elements into page-level parent documents."""
+    skip = ("Table", "Image", "Figure", "Header", "Footer", "PageBreak")
+    grouped = defaultdict(list)
+    headings = {}
+    documents = []
+    used_composite = False
+    for element in elements:
+        name = type(element).__name__
+        if any(token in name for token in skip):
+            continue
+        if "CompositeElement" in name:
+            used_composite = True
+            documents.extend(_documents_from_element(element, base_metadata))
+            continue
+        text = (getattr(element, "text", None) or "").strip()
+        if not text:
+            continue
+        page = _page_from_element(element)
+        grouped[page].append(text)
+        if "Title" in name and page not in headings:
+            headings[page] = text[:200]
+
+    if used_composite and documents:
+        return documents
+
+    for page, parts in grouped.items():
+        text = "\n".join(parts).strip()
+        if not text:
+            continue
+        meta = dict(base_metadata)
+        if page is not None:
+            meta["page"] = page
+        heading = headings.get(page)
+        if heading:
+            meta["heading"] = heading
+        section = _section_from_text(text)
+        if section:
+            meta["section"] = section
+        documents.append(Document(page_content=text, metadata=meta))
+    return documents
+
+
+def _clip_meta(text, limit):
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def stamp_parent_fields(doc, parent_id):
+    """Store page-level text for small-to-big retrieval and dual-channel tables."""
+    raw = doc.page_content or ""
+    payload = {"raw_text": raw, "tables_html": []}
+    if (doc.metadata or {}).get("type") == "table":
+        payload["tables_html"] = [raw]
+    meta = dict(doc.metadata or {})
+    meta["parent_id"] = parent_id
+    meta["parent_text"] = _clip_meta(raw, PARENT_TEXT_CHARS)
+    meta["original_content"] = json.dumps(payload, ensure_ascii=False)
+    doc.metadata = meta
+    return doc
 
 
 def _appendix_start_page(documents):
@@ -379,9 +535,7 @@ def load_pdf_documents(file_path, output_image_dir, source_filename=None, conten
     if content_hash:
         base_metadata["content_hash"] = content_hash
 
-    for element in raw_pdf_elements:
-        if "CompositeElement" in str(type(element)):
-            all_documents.extend(_documents_from_element(element, base_metadata))
+    all_documents.extend(_documents_from_pdf_elements(raw_pdf_elements, base_metadata))
 
     appendix_start = _appendix_start_page(all_documents)
     plumber_tables = _extract_tables_pdfplumber(file_path)
@@ -398,6 +552,7 @@ def load_pdf_documents(file_path, output_image_dir, source_filename=None, conten
     if ENABLE_VISION:
         described = 0
         skipped = 0
+        failed = 0
         for image_name in os.listdir(output_image_dir):
             if not image_name.lower().endswith((".png", ".jpg", ".jpeg")):
                 continue
@@ -405,7 +560,15 @@ def load_pdf_documents(file_path, output_image_dir, source_filename=None, conten
             if not _image_worth_describing(img_path):
                 skipped += 1
                 continue
-            image_summary = summarize_image_with_ollama(img_path)
+            try:
+                image_summary = summarize_image_with_ollama(img_path)
+            except Exception as exc:
+                failed += 1
+                print(f"Vision failed for {image_name} ({exc}); skipping figure.")
+                continue
+            if not image_summary:
+                failed += 1
+                continue
             image_metadata = {
                 "source": filename,
                 "type": "image",
@@ -419,10 +582,21 @@ def load_pdf_documents(file_path, output_image_dir, source_filename=None, conten
                 )
             )
             described += 1
-        print(f"Vision described {described} figures; skipped {skipped} tiny images.")
+        print(
+            f"Vision described {described} figures; skipped {skipped} tiny images; "
+            f"{failed} failed."
+        )
     else:
         print("Vision ingest off (CLOAK_VISION=0); text and tables only.")
 
+    hashed = content_hash or filename
+    for index, doc in enumerate(all_documents):
+        page = (doc.metadata or {}).get("page")
+        kind = (doc.metadata or {}).get("type") or "text"
+        parent_id = f"{hashed}-{kind}-{page if page is not None else 'x'}-{index}"
+        stamp_parent_fields(doc, parent_id)
+
+    print(f"Parent documents for {filename}: {len(all_documents)}")
     return all_documents
 
 
@@ -443,26 +617,94 @@ def load_documents(file_path, output_image_dir, source_filename=None, content_ha
 load_documents_with_vision = load_pdf_documents
 
 
-def split_documents(documents, chunk_size=1000, chunk_overlap=200, separators=["\n\n", "\n", " ", ""]):
-    print(f"Splitting documents into chunks of size {chunk_size} with overlap {chunk_overlap}...")
+def _split_recursive(text, chunk_size, chunk_overlap, separators):
+    """Character splitter; avoids langchain_text_splitters (nltk/scipy on import)."""
+    text = text or ""
+    if not text:
+        return []
+    if len(text) <= chunk_size:
+        return [text]
 
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_size,
-        chunk_overlap=chunk_overlap,
-        separators=separators,
+    seps = list(separators) if separators else ["\n\n", "\n", " ", ""]
+    if seps[-1] != "":
+        seps = seps + [""]
+
+    def split_once(body, remaining):
+        if len(body) <= chunk_size:
+            return [body] if body else []
+        sep, *more = remaining
+        if sep == "":
+            step = max(1, chunk_size - chunk_overlap)
+            return [body[i : i + chunk_size] for i in range(0, len(body), step)]
+        parts = body.split(sep)
+        merged = []
+        current = ""
+        for part in parts:
+            candidate = part if not current else current + sep + part
+            if len(candidate) <= chunk_size:
+                current = candidate
+                continue
+            if current:
+                merged.extend(split_once(current, more))
+            current = part
+        if current:
+            merged.extend(split_once(current, more))
+        return merged
+
+    pieces = split_once(text, seps)
+    return [p for p in pieces if p]
+
+
+def split_documents(documents, chunk_size=None, chunk_overlap=None, separators=["\n\n", "\n", " ", ""]):
+    """Embed small children; keep parent page text on metadata for answering."""
+    chunk_size = chunk_size or CHILD_CHUNK_SIZE
+    chunk_overlap = chunk_overlap or CHILD_CHUNK_OVERLAP
+    print(
+        f"Splitting into child chunks of size {chunk_size} "
+        f"with overlap {chunk_overlap} (small-to-big)..."
     )
 
-    preserved = [doc for doc in documents if doc.metadata.get("type") == "table"]
-    splittable = [doc for doc in documents if doc.metadata.get("type") != "table"]
-    chunks = text_splitter.split_documents(splittable) + preserved
+    preserved = [
+        doc for doc in documents
+        if doc.metadata.get("type") in ("table", "image")
+    ]
+    splittable = [
+        doc for doc in documents
+        if doc.metadata.get("type") not in ("table", "image")
+    ]
+    children = []
+    for parent in splittable:
+        heading = (parent.metadata or {}).get("heading")
+        pieces = [
+            Document(page_content=text, metadata=dict(parent.metadata or {}))
+            for text in _split_recursive(
+                parent.page_content or "", chunk_size, chunk_overlap, separators
+            )
+        ]
+        if not pieces:
+            children.append(parent)
+            continue
+        for piece in pieces:
+            meta = dict(parent.metadata or {})
+            meta.update(piece.metadata or {})
+            body = piece.page_content or ""
+            if heading and heading.lower() not in body[:200].lower():
+                body = f"{heading}\n\n{body}"
+            piece.page_content = body
+            piece.metadata = meta
+            children.append(piece)
+
+    chunks = children + preserved
 
     if chunks:
         for i, chunk in enumerate(chunks[:2]):
             print(f"\nChunk {i+1}:")
             print(f"Source: {chunk.metadata.get('source', 'Unknown')}")
+            print(f"Parent: {chunk.metadata.get('parent_id', '')}")
             print(f"Length: {len(chunk.page_content)} characters")
             print(f"Content:\n{chunk.page_content[:200]}...\n" + "-" * 50)
 
+    print(f"Child chunks: {len(chunks)} from {len(documents)} parents.")
     return chunks
 
 

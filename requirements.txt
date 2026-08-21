@@ -1,0 +1,22 @@
+# Cloak RAG (eval + local FastAPI). Python 3.11–3.12 recommended.
+python-dotenv>=1.0
+chromadb
+langchain-core
+langchain-text-splitters
+langchain-huggingface
+langchain-chroma
+langchain-classic
+langchain-community
+langchain-ollama
+sentence-transformers
+transformers
+torch
+rank-bm25
+fastapi
+uvicorn
+pydantic
+pillow
+
+# PDF ingest only (not required for CRAG HTML eval)
+pdfplumber
+unstructured[pdf]

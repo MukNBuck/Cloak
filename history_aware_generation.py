@@ -9,16 +9,16 @@ Query flow:
 
 import json
 import math
+import os
 import re
+import time
 from collections import defaultdict
 
-from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, AIMessage
-from langchain_ollama import ChatOllama
-from sentence_transformers import CrossEncoder
-
 from cloak_config import (
+    AGENT_RETRIES,
     CHARS_PER_TOKEN,
+    COMPARE_TOP_PER_SIDE,
+    EXTRACT_TOP_DOCS,
     HISTORY_MESSAGES,
     LLM_MODEL,
     MAX_CHUNK_CHARS,
@@ -32,9 +32,14 @@ from cloak_config import (
     RERANK_MAX_CHARS,
     RERANK_MIN_SCORE,
     RERANK_MODEL,
+    SUMMARIZE_MAP_CHUNKS,
     TOP_DOCS,
     torch_device,
 )
+from langchain_core.documents import Document
+from langchain_core.messages import HumanMessage, AIMessage
+from langchain_ollama import ChatOllama
+
 from ingestion_pipeline import load_chunks_from_vectorstore
 
 _DEVICE = torch_device()
@@ -46,10 +51,57 @@ llm = ChatOllama(
     num_predict=NUM_PREDICT,
 )
 
-try:
-    reranker = CrossEncoder(RERANK_MODEL, device=_DEVICE, local_files_only=OFFLINE)
-except TypeError:
-    reranker = CrossEncoder(RERANK_MODEL, device=_DEVICE)
+
+class TransformersReranker:
+    """BGE-style cross-encoder without sentence-transformers/sklearn/scipy."""
+
+    def __init__(self, model_name, device="cpu", max_length=512, batch_size=8):
+        import torch
+        from transformers import AutoModelForSequenceClassification, AutoTokenizer
+
+        kwargs = {}
+        if OFFLINE:
+            kwargs["local_files_only"] = True
+        self.torch = torch
+        self.device = device
+        self.max_length = max_length
+        self.batch_size = batch_size
+        print(f"Loading reranker {model_name} on {device}...")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name, **kwargs)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name, **kwargs)
+        self.model.to(device)
+        self.model.eval()
+
+    def predict(self, pairs):
+        scores = []
+        torch = self.torch
+        for start in range(0, len(pairs), self.batch_size):
+            batch = pairs[start : start + self.batch_size]
+            queries = [pair[0] or "" for pair in batch]
+            docs = [pair[1] or "" for pair in batch]
+            encoded = self.tokenizer(
+                queries,
+                docs,
+                padding=True,
+                truncation=True,
+                max_length=self.max_length,
+                return_tensors="pt",
+            )
+            encoded = {key: value.to(self.device) for key, value in encoded.items()}
+            with torch.no_grad():
+                logits = self.model(**encoded).logits
+            scores.extend(logits.view(-1).float().cpu().tolist())
+        return scores
+
+
+reranker = None
+
+
+def get_reranker():
+    global reranker
+    if reranker is None:
+        reranker = TransformersReranker(RERANK_MODEL, device=_DEVICE)
+    return reranker
 
 APPENDIX_HEADING_RE = re.compile(
     r"(?im)^\s*(appendix|annex)(\s+[a-z0-9]+)?\b"
@@ -273,26 +325,26 @@ def prepend_unique(preferred, existing):
 
 
 def get_answer_context(doc: Document) -> str:
-    raw = doc.metadata.get("original_content")
-    if not raw:
-        return doc.page_content
-
-    try:
-        original = json.loads(raw) if isinstance(raw, str) else raw
-    except (json.JSONDecodeError, TypeError):
-        return doc.page_content
-
-    parts = []
-    raw_text = (original.get("raw_text") or "").strip()
-    if raw_text:
-        parts.append(raw_text)
-
-    tables = original.get("tables_html") or []
-    for i, table in enumerate(tables, 1):
-        if table:
-            parts.append(f"Table {i}:\n{table}")
-
-    return "\n\n".join(parts) if parts else doc.page_content
+    meta = doc.metadata or {}
+    raw = meta.get("original_content")
+    parent = (meta.get("parent_text") or "").strip()
+    parsed_parts = []
+    if raw:
+        try:
+            original = json.loads(raw) if isinstance(raw, str) else raw
+            raw_text = (original.get("raw_text") or "").strip()
+            if raw_text:
+                parsed_parts.append(raw_text)
+            for i, table in enumerate(original.get("tables_html") or [], 1):
+                if table:
+                    parsed_parts.append(f"Table {i}:\n{table}")
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            parsed_parts = []
+    if parsed_parts:
+        return "\n\n".join(parsed_parts)
+    if parent:
+        return parent
+    return doc.page_content
 
 
 def _clip(text, limit):
@@ -369,7 +421,7 @@ def pack_context(docs, char_budget):
 
 
 def citation_excerpt(doc: Document, max_len=420) -> str:
-    return _clip(doc.page_content or "", max_len)
+    return _clip(get_answer_context(doc) or doc.page_content or "", max_len)
 
 
 def appendix_start_page(chunks):
@@ -556,7 +608,7 @@ def _retrieve(session, variation):
 def _rerank_scores(search_question, rerank_docs):
     pairs = [[search_question, _rerank_text(doc)] for doc in rerank_docs]
     try:
-        return reranker.predict(pairs)
+        return get_reranker().predict(pairs)
     except Exception as exc:
         print(f"Reranker failed ({exc}); keeping retrieval order.")
         return [float(len(rerank_docs) - index) for index in range(len(rerank_docs))]
@@ -582,8 +634,323 @@ def _run_llm(prompt, session=None):
     yield text, text
 
 
+INTENT_SUMMARIZE_RE = re.compile(
+    r"\b(summarize|summary|overview|tl;?dr|recap|walk me through)\b", re.I
+)
+INTENT_COMPARE_RE = re.compile(
+    r"\b(compare|versus|\bvs\.?\b|difference between|differ from|contrast)\b", re.I
+)
+INTENT_EXTRACT_RE = re.compile(
+    r"\b(list all|extract|enumerate|tabulate|all of the)\b", re.I
+)
+INTENT_COMPUTE_RE = re.compile(
+    r"\b(how many years older|how much (older|younger|more|less)|age difference|"
+    r"percentage|percent|how long would|area of|times (as )?(many|much)|"
+    r"compared to|how many more)\b",
+    re.I,
+)
+CLAIM_NUM_RE = re.compile(
+    r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+%?|\d{3,}(?:\.\d+)?%?"
+)
+SOURCE_CITE_RE = re.compile(r"\[(?:Source\s*)?(\d+)\]", re.I)
+
+
+def classify_intent(query):
+    text = query or ""
+    if INTENT_SUMMARIZE_RE.search(text):
+        return "summarize"
+    if INTENT_COMPUTE_RE.search(text):
+        return "compute"
+    if INTENT_COMPARE_RE.search(text):
+        return "compare"
+    if INTENT_EXTRACT_RE.search(text):
+        return "extract"
+    return "lookup"
+
+
+def split_compare_topics(query):
+    patterns = [
+        r"(?:compare|contrast)\s+(.+?)\s+(?:and|vs\.?|versus|with)\s+(.+)",
+        r"difference between\s+(.+?)\s+and\s+(.+)",
+        r"(.+?)\s+vs\.?\s+(.+)",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, query or "", re.I)
+        if not match:
+            continue
+        left = match.group(1).strip(" ?.")
+        right = match.group(2).strip(" ?.")
+        if left and right and left.lower() != right.lower():
+            return [left, right]
+    return None
+
+
+def parent_key(doc):
+    meta = doc.metadata or {}
+    if meta.get("parent_id"):
+        return meta["parent_id"]
+    return (
+        meta.get("source"),
+        meta.get("page"),
+        meta.get("type"),
+        (doc.page_content or "")[:80],
+    )
+
+
+def collapse_to_parents(docs):
+    seen = set()
+    unique = []
+    for doc in docs:
+        key = parent_key(doc)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(doc)
+    return unique
+
+
+def write_trace(session, payload):
+    record = dict(payload)
+    record["ts"] = time.time()
+    line = json.dumps(record, ensure_ascii=False, default=str)
+    print(f"CLOAK_TRACE {line}")
+    temp_dir = getattr(session, "temp_dir", None)
+    if not temp_dir:
+        return
+    try:
+        with open(os.path.join(temp_dir, "traces.jsonl"), "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except Exception as exc:
+        print(f"Trace write failed: {exc}")
+
+
+def retrieve_fused(session, search_question):
+    query_variations = search_queries(search_question)
+    query_weights = [2.0] + [1.2] * (len(query_variations) - 1)
+    exact_docs = lexical_hits(search_question, session.chunks)
+    lists = []
+    fetched = 0
+    for variation in query_variations:
+        docs = _retrieve(session, variation)
+        fetched += len(docs or [])
+        lists.append(docs)
+    fused = reciprocal_rank_fusion(lists, k=60, query_weights=query_weights)
+    fused = prepend_unique(exact_docs, fused)
+    return fused, query_variations, fetched, len(exact_docs)
+
+
+def score_documents(search_question, fused_docs, session):
+    rerank_docs = fused_docs[:RERANK_CANDIDATES]
+    if not rerank_docs:
+        return [], {}
+    scores = _rerank_scores(search_question, rerank_docs)
+    raw_by_id = {}
+    question_l = search_question.lower()
+    keys = _strict_terms(search_question)
+    wants_appendix = "appendix" in question_l or "annex" in question_l
+    boost_tables = bool(TABLE_QUERY_RE.search(search_question))
+    appendix_start = None if wants_appendix else appendix_start_page(session.chunks)
+    scored_docs = []
+    for score, doc in zip(scores, rerank_docs):
+        raw = float(score)
+        raw_by_id[id(doc)] = raw
+        adjusted = raw
+        text_l = (get_answer_context(doc) or doc.page_content or "").lower()
+        adjusted += _identifier_boost(text_l, keys)
+        if boost_tables and (doc.metadata or {}).get("type") == "table":
+            adjusted += 0.35
+        if not wants_appendix and chunk_is_appendix(doc, appendix_start):
+            adjusted -= 0.4
+        scored_docs.append((adjusted, doc))
+    scored_docs.sort(key=lambda item: item[0], reverse=True)
+    return scored_docs, raw_by_id
+
+
+def pick_passing(scored_docs, raw_by_id, limit):
+    overfetch = select_top_docs(scored_docs, limit=max(limit * 3, limit))
+    picked = []
+    seen = set()
+    for item in overfetch:
+        doc = item[1]
+        key = parent_key(doc)
+        if key in seen:
+            continue
+        seen.add(key)
+        picked.append(item)
+        if len(picked) >= limit:
+            break
+    score_map = {}
+    source_docs = []
+    for _adjusted, doc in picked:
+        raw = float(raw_by_id.get(id(doc), 0.0))
+        score_map[id(doc)] = (raw, _sigmoid(raw))
+        source_docs.append(doc)
+    passing = [
+        doc for doc in source_docs
+        if score_map.get(id(doc), (0.0, 0.0))[1] >= RERANK_MIN_SCORE
+    ]
+    top_confidence = max((score_map[id(doc)][1] for doc in source_docs), default=0.0)
+    return source_docs, passing, score_map, top_confidence
+
+
+def retry_search_question(query, search_question, source_docs):
+    combined = " ".join(get_answer_context(doc) or "" for doc in source_docs).lower()
+    missing = [term for term in _key_terms(query) if term.lower() not in combined]
+    if missing:
+        return f"{search_question} {' '.join(missing[:8])}"
+    keys = _key_terms(query)
+    joined = " ".join(keys)
+    if joined and joined.lower() != (search_question or "").lower():
+        return joined
+    return None
+
+
+def _parse_source_numbers(text):
+    values = []
+    for raw in CLAIM_NUM_RE.findall(text or "") + re.findall(r"\b\d+(?:\.\d+)?%?\b", text or ""):
+        try:
+            values.append(float(str(raw).replace(",", "").replace("%", "")))
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def _number_supported(num_str, packed_l, packed_nums):
+    if (num_str or "").lower() in packed_l:
+        return True
+    try:
+        value = float(str(num_str).replace(",", "").replace("%", ""))
+    except (TypeError, ValueError):
+        return False
+    for source in packed_nums:
+        if abs(source - value) <= 0.51:
+            return True
+    for index, left in enumerate(packed_nums):
+        for right in packed_nums[index + 1 :]:
+            if abs(abs(left - right) - value) <= 0.51:
+                return True
+            if abs((left + right) - value) <= 0.51:
+                return True
+            if abs((left * right) - value) <= 1.0:
+                return True
+            if right and abs((left / right) * 100.0 - value) <= 0.6:
+                return True
+            if left and abs((right / left) * 100.0 - value) <= 0.6:
+                return True
+    return False
+
+
+def verify_grounding(answer, packed_text, n_sources, intent=None):
+    text = (answer or "").strip()
+    if not text or REFUSAL_RE.match(text):
+        return True, text
+    if re.match(r"^\s*invalid question\b", text, re.I):
+        return True, text
+    packed_l = (packed_text or "").lower()
+    cites = [int(num) for num in SOURCE_CITE_RE.findall(text)]
+    if cites and any(num < 1 or num > n_sources for num in cites):
+        print("Grounding fail: citation out of range")
+        return False, "I don't know"
+    packed_nums = _parse_source_numbers(packed_text)
+    missing_nums = [
+        num for num in CLAIM_NUM_RE.findall(text)
+        if not _number_supported(num, packed_l, packed_nums)
+    ]
+    if missing_nums:
+        print(f"Grounding fail: numbers not in sources {missing_nums[:5]}")
+        return False, "I don't know"
+    if intent == "compute":
+        return True, text
+    keys = _strict_terms(text)
+    if keys:
+        hit = sum(1 for key in keys if key.lower() in packed_l)
+        if hit / len(keys) < 0.5:
+            print("Grounding fail: identifiers missing from sources")
+            return False, "I don't know"
+    return True, text
+
+
+def retrieve_and_rerank(query, session, limit=None):
+    """Shared retrieval core for chat and the eval harness."""
+    search_question = rewrite_with_history(query, session.chat_history)
+    fused, variations, fetched, exact_n = retrieve_fused(session, search_question)
+    scored, raw_by_id = score_documents(search_question, fused, session)
+    source_docs, passing, score_map, top_confidence = pick_passing(
+        scored, raw_by_id, limit or TOP_DOCS
+    )
+    return {
+        "search_question": search_question,
+        "variations": variations,
+        "fetched": fetched,
+        "exact_n": exact_n,
+        "fused_n": len(fused),
+        "source_docs": source_docs,
+        "passing": passing,
+        "score_map": score_map,
+        "top_confidence": top_confidence,
+        "scored_docs": scored,
+        "raw_by_id": raw_by_id,
+    }
+
+
+def _answer_prompt(query, combined_docs, history_section="", intent="lookup"):
+    extra = ""
+    if intent == "compute":
+        extra = (
+            "This question needs a calculation (age gap, difference, percentage, area, or ratio). "
+            "Extract the input numbers from the sources, compute the result, and put that result "
+            "in <final_answer>. If a required input is missing, respond with \"I don't know\".\n"
+        )
+    elif intent == "compare":
+        extra = (
+            "Compare the two sides using only the sources. State which is higher/lower or the "
+            "difference. If either side is missing, respond with \"I don't know\".\n"
+        )
+    elif intent == "extract":
+        extra = "List every matching item from the sources. Do not add items that are not written there.\n"
+    return f"""Answer strictly from the numbered sources.
+If the sources do not contain the answer, respond with "I don't know".
+If the question assumes something false (wrong person, title, event, or fact), respond with "invalid question".
+
+{history_section}Sources:
+{combined_docs}
+
+Question: {query}
+
+{extra}Tables are written as "Row: Header is value". Do not mix values across rows.
+Do not invent names, dates, or quotes that are not in the sources.
+Computed values (differences, products, percentages) are allowed when the inputs are in the sources.
+Write <reasoning> that only names which source numbers you used and why they are relevant. Do not repeat the answer there.
+Then put a short user-facing answer only inside <final_answer> tags. Prefer the same names and numbers as the sources.
+
+Answer:"""
+
+
+def _generate_answer(query, session, passing, score_map, history_block, extra):
+    char_budget = source_char_budget(query, history_block)
+    combined_docs, top_docs = pack_context(passing[:MAX_PACKED_DOCS], char_budget)
+    citations = _build_citations(top_docs, score_map)
+    history_section = f"{history_block}\n\n" if history_block else ""
+    prompt = _answer_prompt(query, combined_docs, history_section, extra.get("intent") or "lookup")
+    assembled = ""
+    for _piece, assembled in _run_llm(prompt, session):
+        if session_cancelled(session):
+            return None, None, citations, extra, None
+    display_answer = extract_display_answer(assembled)
+    grounded, display_answer = verify_grounding(
+        display_answer, combined_docs, len(top_docs), extra.get("intent")
+    )
+    extra = dict(extra)
+    extra["grounded"] = grounded
+    if not grounded:
+        extra["rerank_passed"] = False
+    reasoning = "" if not grounded else distinct_reasoning(display_answer, extract_reasoning(assembled))
+    return (display_answer, reasoning, citations, extra, top_docs)
+
+
 def ask_question_events(query, session):
     chat_history = session.chat_history
+    started = time.time()
 
     def cancelled():
         return session_cancelled(session)
@@ -603,73 +970,45 @@ def ask_question_events(query, session):
         yield _stopped()
         return
 
+    intent = classify_intent(query)
     search_question = rewrite_with_history(query, chat_history)
+    yield {
+        "type": "stage",
+        "id": "understanding",
+        "label": "Understanding the question",
+        "detail": f"{intent}: {search_question[:120]}",
+    }
     if search_question != query:
         print(f"Follow-up resolved to: {search_question}")
-        yield {
-            "type": "stage",
-            "id": "understanding",
-            "label": "Understanding the question",
-            "detail": search_question[:120],
-        }
-    else:
-        if chat_history:
-            print("Skipping history rewrite; question is already standalone.")
-        yield {
-            "type": "stage",
-            "id": "understanding",
-            "label": "Understanding the question",
-            "detail": search_question[:120],
-        }
 
-    print(f"Searching for {search_question}...")
+    if intent == "summarize":
+        yield from _summarize_events(query, session)
+        return
 
+    compare_topics = split_compare_topics(query) if intent == "compare" else None
+    if compare_topics:
+        yield from _compare_events(query, session, compare_topics)
+        return
+
+    keep_n = EXTRACT_TOP_DOCS if intent == "extract" else TOP_DOCS
     yield {
         "type": "stage",
         "id": "fetching",
         "label": "Fetching chunks",
         "detail": "Keyword scan and hybrid search",
     }
-    query_variations = search_queries(search_question)
-    for i, variation in enumerate(query_variations, 1):
-        print(f"{i}. {variation}")
-    query_weights = [2.0] + [1.2] * (len(query_variations) - 1)
-
-    exact_docs = lexical_hits(search_question, session.chunks)
-    print(f"Exact-term scan found {len(exact_docs)} matching chunks")
-
-    all_retrieval_results = []
-    fetched = 0
-    for i, variation in enumerate(query_variations, 1):
-        if cancelled():
-            yield _stopped()
-            return
-        print(f"RESULTS FOR QUERY {i}: {variation}")
-        docs = _retrieve(session, variation)
-        fetched += len(docs or [])
-        all_retrieval_results.append(docs)
-        yield {
-            "type": "stage",
-            "id": "fetching",
-            "label": "Fetching chunks",
-            "detail": f"Query {i}/{len(query_variations)} · {fetched} hits so far",
-        }
-
-    print(f"\nFusing {len(all_retrieval_results)} query result lists with RRF...")
-    fused_docs = reciprocal_rank_fusion(
-        all_retrieval_results, k=60, query_weights=query_weights
-    )
-    fused_docs = prepend_unique(exact_docs, fused_docs)
-    print(f"RRF produced {len(fused_docs)} unique candidates")
-
-    if cancelled():
-        yield _stopped()
-        return
-
-    if not fused_docs:
+    retrieval = retrieve_and_rerank(query, session, limit=keep_n)
+    fused_n = retrieval["fused_n"]
+    yield {
+        "type": "stage",
+        "id": "fetching",
+        "label": "Fetching chunks",
+        "detail": f"{retrieval['fetched']} hits · {fused_n} unique · {retrieval['exact_n']} exact",
+    }
+    if not fused_n:
         answer = "I don't know"
         _remember(chat_history, query, answer)
-        print(f"Answer: {answer}")
+        write_trace(session, {"event": "empty_retrieval", "query": query, "intent": intent})
         yield _complete(answer)
         return
 
@@ -677,70 +1016,45 @@ def ask_question_events(query, session):
         "type": "stage",
         "id": "reranking",
         "label": "Reranking sources",
-        "detail": f"{len(fused_docs)} unique chunks",
+        "detail": f"{fused_n} unique chunks",
     }
-    print("Reranking fused candidates with cross-encoder...")
-    rerank_docs = fused_docs[:RERANK_CANDIDATES]
-    scores = _rerank_scores(search_question, rerank_docs)
-    raw_by_id = {}
-    question_l = search_question.lower()
-    keys = _strict_terms(search_question)
-    wants_appendix = "appendix" in question_l or "annex" in question_l
-    boost_tables = bool(TABLE_QUERY_RE.search(search_question))
-    appendix_start = None if wants_appendix else appendix_start_page(session.chunks)
-    scored_docs = []
-    for score, doc in zip(scores, rerank_docs):
-        raw = float(score)
-        raw_by_id[id(doc)] = raw
-        adjusted = raw
-        text_l = (doc.page_content or "").lower()
-        adjusted += _identifier_boost(text_l, keys)
-        if boost_tables and doc.metadata.get("type") == "table":
-            adjusted += 0.35
-        if not wants_appendix and chunk_is_appendix(doc, appendix_start):
-            adjusted -= 0.4
-        scored_docs.append((adjusted, doc))
-    scored_docs.sort(key=lambda item: item[0], reverse=True)
+    source_docs = retrieval["source_docs"]
+    passing = retrieval["passing"]
+    score_map = retrieval["score_map"]
+    top_confidence = retrieval["top_confidence"]
+    retried = False
+    if not passing and AGENT_RETRIES > 0:
+        retry_q = retry_search_question(query, retrieval["search_question"], source_docs)
+        if retry_q and retry_q.lower() != retrieval["search_question"].lower():
+            retried = True
+            yield {
+                "type": "stage",
+                "id": "retry",
+                "label": "Retrying retrieval",
+                "detail": retry_q[:120],
+            }
+            fused, _, _, _ = retrieve_fused(session, retry_q)
+            fused = prepend_unique(source_docs, fused)
+            scored, raw_by_id = score_documents(retrieval["search_question"], fused, session)
+            source_docs, passing, score_map, top_confidence = pick_passing(
+                scored, raw_by_id, keep_n
+            )
 
-    ranked = select_top_docs(scored_docs, limit=TOP_DOCS)
-    score_map = {}
-    for _adjusted, doc in ranked:
-        raw = raw_by_id.get(id(doc), 0.0)
-        score_map[id(doc)] = (raw, _sigmoid(raw))
-    for index, (adjusted, doc) in enumerate(scored_docs[:8], 1):
-        meta = doc.metadata or {}
-        raw, confidence = score_map.get(id(doc), (raw_by_id.get(id(doc), 0.0), 0.0))
-        if id(doc) not in score_map:
-            confidence = _sigmoid(raw)
-        preview = re.sub(r"\s+", " ", (doc.page_content or ""))[:90]
-        print(
-            f"  rank {index}: logit={raw:.3f} conf={confidence:.3f} adj={adjusted:.3f} "
-            f"type={meta.get('type')} page={meta.get('page')} "
-            f"section={meta.get('section')} {preview!r}"
-        )
-
-    source_docs = [doc for _adjusted, doc in ranked]
-    passing = [
-        doc for doc in source_docs
-        if score_map.get(id(doc), (0.0, 0.0))[1] >= RERANK_MIN_SCORE
-    ]
-    top_confidence = max((score_map[id(doc)][1] for doc in source_docs), default=0.0)
     citations = _build_citations(source_docs, score_map)
-    source_bits = []
-    for item in citations:
-        bit = item.get("source") or "document.pdf"
-        if item.get("page"):
-            bit += f" p.{item['page']}"
-        if item.get("rerank_confidence") is not None:
-            bit += f" ({item['rerank_confidence']:.2f})"
-        source_bits.append(bit)
+    extra = {
+        "rerank_confidence": round(float(top_confidence), 4),
+        "rerank_min_score": RERANK_MIN_SCORE,
+        "rerank_passed": bool(passing),
+        "intent": intent,
+        "retried": retried,
+    }
     yield {
         "type": "stage",
         "id": "reranking",
         "label": "Reranking sources",
         "detail": (
-            f"Top {len(citations)} · best conf {top_confidence:.2f} "
-            f"(min {RERANK_MIN_SCORE:.2f}) · {', '.join(source_bits[:3])}"
+            f"Top {len(source_docs)} · best conf {top_confidence:.2f} "
+            f"(min {RERANK_MIN_SCORE:.2f})"
         ),
         "citations": citations,
     }
@@ -749,40 +1063,28 @@ def ask_question_events(query, session):
         yield _stopped(citations)
         return
 
-    confidence_extra = {
-        "rerank_confidence": round(float(top_confidence), 4),
-        "rerank_min_score": RERANK_MIN_SCORE,
-        "rerank_passed": bool(passing),
-    }
-
     if not passing:
         answer = "I don't know"
         _remember(chat_history, query, answer)
+        write_trace(
+            session,
+            {
+                "event": "low_confidence",
+                "query": query,
+                "intent": intent,
+                "confidence": top_confidence,
+                "retried": retried,
+                "elapsed": time.time() - started,
+            },
+        )
         print(
             f"Rerank confidence {top_confidence:.3f} < {RERANK_MIN_SCORE:.3f}; "
             "skipping generation."
         )
-        print(f"Answer: {answer}")
-        yield _complete(answer, citations, confidence_extra)
+        yield _complete(answer, citations, extra)
         return
 
     history_block = _history_block(chat_history)
-    char_budget = source_char_budget(query, history_block)
-    combined_docs, top_docs = pack_context(passing[:MAX_PACKED_DOCS], char_budget)
-    citations = _build_citations(top_docs, score_map)
-    yield {
-        "type": "stage",
-        "id": "reranking",
-        "label": "Reranking sources",
-        "detail": f"Using {len(citations)} sources above {RERANK_MIN_SCORE:.2f}",
-        "citations": citations,
-    }
-
-    if cancelled():
-        yield _stopped(citations)
-        return
-
-    history_section = f"{history_block}\n\n" if history_block else ""
     yield {
         "type": "stage",
         "id": "reasoning",
@@ -790,44 +1092,178 @@ def ask_question_events(query, session):
         "detail": "Writing the answer",
         "citations": citations,
     }
-
-    prompt = f"""Answer strictly from the numbered sources. If the sources do not contain the answer, respond with "I don't know".
-
-{history_section}Sources:
-{combined_docs}
-
-Question: {query}
-
-Tables are written as "Row: Header is value". Do not mix values across rows.
-Do not invent names, numbers, dates, or quotes that are not in the sources.
-Write <reasoning> that only names which source numbers you used and why they are relevant. Do not repeat the answer there.
-Then put the user-facing answer only inside <final_answer> tags.
-
-Answer:"""
-
-    assembled = ""
-    for _piece, assembled in _run_llm(prompt, session):
-        if cancelled():
-            yield _stopped(citations)
-            return
-
-    if cancelled():
+    generated = _generate_answer(query, session, passing, score_map, history_block, extra)
+    if generated[0] is None:
         yield _stopped(citations)
         return
-
-    display_answer = extract_display_answer(assembled)
-    reasoning = distinct_reasoning(display_answer, extract_reasoning(assembled))
+    display_answer, reasoning, citations, extra, _top_docs = generated
     _remember(chat_history, query, display_answer)
+    write_trace(
+        session,
+        {
+            "event": "complete",
+            "query": query,
+            "intent": intent,
+            "confidence": top_confidence,
+            "retried": retried,
+            "grounded": extra.get("grounded", True),
+            "elapsed": time.time() - started,
+            "answer": display_answer[:240],
+        },
+    )
     print(f"Answer: {display_answer}")
-
     yield {
         "type": "complete",
         "answer": display_answer,
         "context": [item["excerpt"] for item in citations],
         "citations": citations,
         "reasoning": reasoning,
-        **confidence_extra,
+        **extra,
+        "rerank_passed": True if extra.get("grounded", True) else False,
+    }
+
+
+def _summarize_events(query, session):
+    names = {
+        (chunk.metadata or {}).get("source")
+        for chunk in session.chunks
+        if (chunk.metadata or {}).get("source")
+    }
+    mentioned = [name for name in names if name.lower() in (query or "").lower()]
+    pool = session.chunks
+    if mentioned:
+        pool = [
+            chunk for chunk in session.chunks
+            if (chunk.metadata or {}).get("source") in mentioned
+        ]
+    parents = collapse_to_parents(pool)[:SUMMARIZE_MAP_CHUNKS]
+    if not parents:
+        answer = "I don't know"
+        _remember(session.chat_history, query, answer)
+        yield _complete(answer)
+        return
+    yield {
+        "type": "stage",
+        "id": "summarize",
+        "label": "Summarizing document",
+        "detail": f"{len(parents)} pages/sections",
+    }
+    citations = _build_citations(parents[:TOP_DOCS])
+    partials = []
+    for index, doc in enumerate(parents, 1):
+        if session_cancelled(session):
+            yield _stopped(citations)
+            return
+        yield {
+            "type": "stage",
+            "id": "summarize",
+            "label": "Summarizing document",
+            "detail": f"Section {index}/{len(parents)}",
+            "citations": citations,
+        }
+        body = _clip(get_answer_context(doc), 3500)
+        prompt = (
+            "Summarize this document section densely. Keep names, numbers, dates, "
+            "and obligations. Output only the summary.\n\n"
+            f"{body}"
+        )
+        assembled = ""
+        for _piece, assembled in _run_llm(prompt, session):
+            if session_cancelled(session):
+                yield _stopped(citations)
+                return
+        text = extract_display_answer(assembled) or assembled.strip()
+        if text:
+            partials.append(text)
+    if not partials:
+        answer = "I don't know"
+        _remember(session.chat_history, query, answer)
+        yield _complete(answer, citations)
+        return
+    combined = "\n\n".join(partials)
+    final_prompt = (
+        "Combine these section summaries into one coherent Markdown summary "
+        "with a short overview, key points, and important numbers or dates. "
+        "Use only this material.\n\n"
+        f"{_clip(combined, 12000)}\n\nUser request: {query}\n\n"
+        "Put the user-facing summary inside <final_answer> tags."
+    )
+    assembled = ""
+    for _piece, assembled in _run_llm(final_prompt, session):
+        if session_cancelled(session):
+            yield _stopped(citations)
+            return
+    display_answer = extract_display_answer(assembled) or assembled.strip()
+    _remember(session.chat_history, query, display_answer)
+    write_trace(session, {"event": "summarize", "query": query, "sections": len(parents)})
+    yield {
+        "type": "complete",
+        "answer": display_answer,
+        "context": [item["excerpt"] for item in citations],
+        "citations": citations,
+        "reasoning": "",
+        "intent": "summarize",
         "rerank_passed": True,
+    }
+
+
+def _compare_events(query, session, topics):
+    yield {
+        "type": "stage",
+        "id": "compare",
+        "label": "Comparing topics",
+        "detail": " vs ".join(topics)[:120],
+    }
+    combined_docs = []
+    score_map = {}
+    for topic in topics:
+        retrieval = retrieve_and_rerank(topic, session, limit=COMPARE_TOP_PER_SIDE)
+        chosen = retrieval["passing"] or retrieval["source_docs"][:1]
+        for doc in chosen:
+            combined_docs.append(doc)
+            score_map.update(retrieval["score_map"])
+    combined_docs = collapse_to_parents(combined_docs)
+    passing = [
+        doc for doc in combined_docs
+        if score_map.get(id(doc), (0.0, 0.0))[1] >= RERANK_MIN_SCORE
+    ]
+    citations = _build_citations(combined_docs, score_map)
+    extra = {
+        "intent": "compare",
+        "rerank_passed": bool(passing),
+        "rerank_min_score": RERANK_MIN_SCORE,
+        "rerank_confidence": round(
+            max((score_map.get(id(doc), (0.0, 0.0))[1] for doc in combined_docs), default=0.0),
+            4,
+        ),
+    }
+    if not passing:
+        answer = "I don't know"
+        _remember(session.chat_history, query, answer)
+        yield _complete(answer, citations, extra)
+        return
+    history_block = _history_block(session.chat_history)
+    yield {
+        "type": "stage",
+        "id": "reasoning",
+        "label": "Reasoning",
+        "detail": "Writing the comparison",
+        "citations": citations,
+    }
+    generated = _generate_answer(query, session, passing, score_map, history_block, extra)
+    if generated[0] is None:
+        yield _stopped(citations)
+        return
+    display_answer, reasoning, citations, extra, _top = generated
+    _remember(session.chat_history, query, display_answer)
+    write_trace(session, {"event": "compare", "query": query, "topics": topics})
+    yield {
+        "type": "complete",
+        "answer": display_answer,
+        "context": [item["excerpt"] for item in citations],
+        "citations": citations,
+        "reasoning": reasoning,
+        **extra,
     }
 
 
@@ -843,5 +1279,6 @@ def ask_question(query, session):
                 "rerank_confidence": event.get("rerank_confidence"),
                 "rerank_min_score": event.get("rerank_min_score"),
                 "rerank_passed": event.get("rerank_passed"),
+                "intent": event.get("intent"),
             }
     return result
