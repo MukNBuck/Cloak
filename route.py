@@ -80,6 +80,54 @@ ROUTE_LABELS = {
 }
 
 
+def hop_subqueries(query: str) -> list[str]:
+    """Split nested fact questions into an inner search and a shorter outer search.
+
+    Example: "who was the goalkeeper of the team that won the final"
+    -> "team that won the final", "goalkeeper team"
+    """
+    text = (query or "").strip().rstrip("?").strip()
+    if not text:
+        return []
+    extras: list[str] = []
+
+    match = re.search(
+        r"\b(?:who|what|which)\s+(?:was|is|were|are|did)?\s*(?:the\s+)?"
+        r"(.+?)\s+of\s+(?:the\s+)?(.+?)\s+that\s+(.+)$",
+        text,
+        re.I,
+    )
+    if match:
+        outer, entity, clause = (group.strip() for group in match.groups())
+        if entity and clause:
+            extras.append(f"{entity} that {clause}")
+        if outer and entity:
+            extras.append(f"{outer} {entity}")
+
+    match = re.search(
+        r"\b(?:what is the name of|name of|who is|who was)\s+(?:the\s+)?"
+        r"(.+?)\s+who\s+(.+)$",
+        text,
+        re.I,
+    )
+    if match:
+        role, clause = (group.strip() for group in match.groups())
+        if role and clause:
+            extras.append(f"{role} who {clause}")
+        if role:
+            extras.append(role)
+
+    seen = {text.lower()}
+    unique = []
+    for item in extras:
+        key = item.lower()
+        if key in seen or len(item) < 6:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique[:2]
+
+
 def classify_intent(query: str) -> str:
     text = query or ""
     if INTENT_SUMMARIZE_RE.search(text):

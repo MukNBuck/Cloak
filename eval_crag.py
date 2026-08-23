@@ -5,7 +5,7 @@ question. Relevance of those pages is not guaranteed, so this harness
 reports two layers:
 
   corpus   – is the gold answer even in the provided pages? (upper bound)
-  retrieve – does Cloak's top-3 after rerank contain the gold?
+  retrieve – do Cloak's packed reranked chunks contain the gold?
   generate – optional full answer vs gold (needs Ollama)
 
 The raw jsonl is ~5GB because it stores full HTML. The first run writes a
@@ -14,7 +14,7 @@ snippet-only cache next to the file so later runs stay light.
 Examples (from the Cloak/ directory):
 
   py -3 eval_crag.py --limit 40
-  py -3 eval_crag.py --mode corpus --limit 200
+  py -3 eval_crag.py --mode corpus --limit 200 --html
   py -3 eval_crag.py --mode generate --limit 16 --html
 """
 
@@ -76,37 +76,119 @@ STOPWORDS = frozenset(
 TOKEN_RE = re.compile(r"[a-z0-9]+", re.I)
 
 
+HTML_TEXT_LIMIT = int(os.getenv("CLOAK_HTML_LIMIT", "20000") or "20000")
+
+
 class _HTMLText(HTMLParser):
     def __init__(self):
         super().__init__()
         self.parts = []
         self._skip = 0
+        self._table_depth = 0
 
     def handle_starttag(self, tag, attrs):
         if tag in {"script", "style", "noscript", "svg"}:
             self._skip += 1
+        elif tag == "table":
+            self._table_depth += 1
 
     def handle_endtag(self, tag):
         if tag in {"script", "style", "noscript", "svg"} and self._skip:
             self._skip -= 1
+        elif tag == "table" and self._table_depth:
+            self._table_depth -= 1
 
     def handle_data(self, data):
-        if not self._skip and data and data.strip():
-            self.parts.append(data)
+        if self._skip or self._table_depth or not data or not data.strip():
+            return
+        self.parts.append(data)
 
 
-def html_to_text(html, limit=6000):
-    if not html:
+class _HTMLTableParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.tables = []
+        self._table = None
+        self._row = None
+        self._cell = None
+        self._in_cell = False
+
+    def handle_starttag(self, tag, attrs):
+        if tag == "table":
+            self._table = []
+        elif tag == "tr" and self._table is not None:
+            self._row = []
+        elif tag in {"td", "th"} and self._row is not None:
+            self._cell = []
+            self._in_cell = True
+
+    def handle_endtag(self, tag):
+        if tag in {"td", "th"} and self._row is not None and self._cell is not None:
+            self._row.append(re.sub(r"\s+", " ", "".join(self._cell)).strip())
+            self._in_cell = False
+            self._cell = None
+        elif tag == "tr" and self._table is not None and self._row is not None:
+            if any(self._row):
+                self._table.append(self._row)
+            self._row = None
+        elif tag == "table" and self._table is not None:
+            if self._table:
+                self.tables.append(self._table)
+            self._table = None
+
+    def handle_data(self, data):
+        if self._in_cell and self._cell is not None:
+            self._cell.append(data)
+
+
+def _verbalize_table_rows(rows):
+    if not rows:
         return ""
-    parser = _HTMLText()
+    headers = [cell or f"Column {index}" for index, cell in enumerate(rows[0], 1)]
+    lines = []
+    body = rows[1:] if len(rows) > 1 else []
+    for row in body:
+        pairs = []
+        for header, value in zip(headers, row):
+            if value:
+                pairs.append(f"{header} is {value}")
+        if pairs:
+            lines.append("Row: " + "; ".join(pairs) + ".")
+    return "\n".join(lines)
+
+
+def html_tables_text(html):
+    if not html or "<table" not in html.lower():
+        return ""
+    parser = _HTMLTableParser()
     try:
         parser.feed(html)
         parser.close()
     except Exception:
+        return ""
+    blocks = [_verbalize_table_rows(table) for table in parser.tables]
+    return "\n\n".join(block for block in blocks if block)
+
+
+def html_to_text(html, limit=None):
+    if not html:
+        return ""
+    if limit is None:
+        limit = HTML_TEXT_LIMIT
+    parser = _HTMLText()
+    try:
+        parser.feed(html)
+        parser.close()
+        text = re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
+    except Exception:
         text = re.sub(r"<[^>]+>", " ", html)
-        return re.sub(r"\s+", " ", text).strip()[:limit]
-    text = re.sub(r"\s+", " ", " ".join(parser.parts)).strip()
-    return text[:limit]
+        text = re.sub(r"\s+", " ", text).strip()
+    tables = html_tables_text(html)
+    # Keep verbalized tables even when the page body is truncated.
+    body = text[:limit]
+    if tables:
+        return f"{body}\n\n{tables[:limit]}".strip()
+    return body
 
 
 def normalize(text):
@@ -249,7 +331,7 @@ def attach_html(src: Path, records):
     return merged
 
 
-def page_text(page, html_limit=6000):
+def page_text(page, html_limit=None):
     parts = [
         page.get("page_name") or "",
         page.get("page_snippet") or "",
@@ -290,6 +372,20 @@ def record_to_documents(record):
         )
         stamp_parent_fields(doc, f"{iid}-{index}")
         docs.append(doc)
+        tables = html_tables_text(page.get("page_result") or "")
+        if tables:
+            table_doc = Document(
+                page_content=tables,
+                metadata={
+                    "source": name,
+                    "type": "table",
+                    "content_hash": iid,
+                    "page": index + 1,
+                    "heading": name,
+                },
+            )
+            stamp_parent_fields(table_doc, f"{iid}-{index}-table")
+            docs.append(table_doc)
     return docs
 
 
@@ -312,8 +408,14 @@ def build_session(record):
 def retrieved_text(result):
     from history_aware_generation import get_answer_context
 
-    docs = result.get("passing") or result.get("source_docs") or []
+    docs = result.get("source_docs") or result.get("passing") or []
     return "\n\n".join(get_answer_context(doc) or doc.page_content or "" for doc in docs)
+
+
+def retrieval_keep_n(intent):
+    from cloak_config import EXTRACT_TOP_DOCS, MAX_PACKED_DOCS, TOP_DOCS
+
+    return max(EXTRACT_TOP_DOCS if intent == "extract" else TOP_DOCS, MAX_PACKED_DOCS)
 
 
 def score_record(record, mode="retrieval"):
@@ -351,7 +453,7 @@ def score_record(record, mode="retrieval"):
 
         query = record.get("query") or ""
         row["intent"] = classify_intent(query)
-        retrieval = retrieve_and_rerank(query, session)
+        retrieval = retrieve_and_rerank(query, session, limit=retrieval_keep_n(row["intent"]))
         hay_r = retrieved_text(retrieval)
         hit, cov = gold_in_text(golds, hay_r)
         row["retrieval_hit"] = hit
@@ -469,7 +571,7 @@ def main(argv=None):
     parser.add_argument(
         "--html",
         action="store_true",
-        help="Strip full page HTML into the corpus (slower, better recall)",
+        help="Reattach full page HTML (uses CLOAK_HTML_LIMIT, default 20000 chars/page)",
     )
     parser.add_argument("--out", default="", help="Write JSON results to this path")
     args = parser.parse_args(argv)

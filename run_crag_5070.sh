@@ -46,11 +46,11 @@ run_one() {
 case "$MODE_ARG" in
   smoke)
     # Fast sanity: corpus upper bound + small retrieval sample
-    run_one smoke_corpus --mode corpus --limit 80
+    run_one smoke_corpus --mode corpus --limit 80 --html
     run_one smoke_retrieval --mode retrieval --limit 20 --html
     ;;
   corpus)
-    run_one corpus --mode corpus --limit "${LIMIT:-200}"
+    run_one corpus --mode corpus --limit "${LIMIT:-200}" --html
     ;;
   retrieval)
     run_one retrieval --mode retrieval --limit "${LIMIT:-100}" --html
@@ -59,7 +59,7 @@ case "$MODE_ARG" in
     run_one generate --mode generate --limit "${LIMIT:-40}" --html
     ;;
   all)
-    run_one corpus --mode corpus --limit 200
+    run_one corpus --mode corpus --limit 200 --html
     run_one retrieval --mode retrieval --limit 100 --html
     run_one generate --mode generate --limit 40 --html
     ;;

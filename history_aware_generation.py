@@ -41,7 +41,7 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
 
-from route import classify_intent, decide_route, route_label
+from route import classify_intent, decide_route, hop_subqueries, route_label
 
 _DEVICE = torch_device()
 _llm_lock = threading.Lock()
@@ -254,15 +254,17 @@ def rewrite_with_history(query, chat_history):
 
 
 def search_queries(original_query):
-    """Keyword variants only. Local LLMs invent terms if asked to rewrite searches."""
+    """Keyword and hop variants only. Local LLMs invent terms if asked to rewrite searches."""
     queries = [original_query]
     keys = _key_terms(original_query)
-    if not keys:
-        return queries
-    joined = " ".join(keys)
-    if joined.lower() != original_query.lower():
-        queries.append(joined)
-    return queries[:2]
+    if keys:
+        joined = " ".join(keys)
+        if joined.lower() != original_query.lower():
+            queries.append(joined)
+    for hop in hop_subqueries(original_query):
+        if hop.lower() not in {item.lower() for item in queries}:
+            queries.append(hop)
+    return queries[:4]
 
 
 def lexical_hits(query, chunks, limit=8):
@@ -737,14 +739,14 @@ def parent_key(doc):
     )
 
 
-def collapse_to_parents(docs):
-    seen = set()
+def collapse_to_parents(docs, max_per_parent=2):
+    counts = defaultdict(int)
     unique = []
     for doc in docs:
         key = parent_key(doc)
-        if key in seen:
+        if counts[key] >= max(1, int(max_per_parent)):
             continue
-        seen.add(key)
+        counts[key] += 1
         unique.append(doc)
     return unique
 
@@ -832,16 +834,16 @@ def score_documents(search_question, fused_docs, session):
     return scored_docs, raw_by_id
 
 
-def pick_passing(scored_docs, raw_by_id, limit):
+def pick_passing(scored_docs, raw_by_id, limit, per_parent=2):
     overfetch = select_top_docs(scored_docs, limit=max(limit * 3, limit))
     picked = []
-    seen = set()
+    parent_counts = defaultdict(int)
     for item in overfetch:
         doc = item[1]
         key = parent_key(doc)
-        if key in seen:
+        if parent_counts[key] >= max(1, int(per_parent)):
             continue
-        seen.add(key)
+        parent_counts[key] += 1
         picked.append(item)
         if len(picked) >= limit:
             break
