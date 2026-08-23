@@ -24,7 +24,7 @@
         "n": 5,
         "corpus_hit": null,
         "retrieval_hit": 0.0,
-        "generate_hit": 0.2
+        "generate_hit": 0.0
       },
       "multi-hop": {
         "n": 5,
@@ -48,16 +48,16 @@
         "n": 5,
         "corpus_hit": 0.6,
         "retrieval_hit": 0.6,
-        "generate_hit": 0.4
+        "generate_hit": 0.2
       },
       "simple_w_condition": {
         "n": 5,
         "corpus_hit": 0.8,
         "retrieval_hit": 0.8,
-        "generate_hit": 0.0
+        "generate_hit": 0.4
       }
     },
-    "elapsed_sec": 239.7,
+    "elapsed_sec": 229.1,
     "mode": "generate",
     "path": "e:\\crag_task_1_and_2_dev_v4.jsonl\\crag_task_1_and_2_dev_v4.jsonl"
   },
@@ -76,7 +76,7 @@
       "confidence": 0.3743,
       "passed_gate": true,
       "intent": "compute",
-      "pred": "Khloé Kardashian is 11 years older than her youngest sister, Kylie Jenner.",
+      "pred": "Khloé Kardashian is 13 years older than her youngest sister, Kylie Jenner.",
       "generate_hit": true,
       "chunks": 93
     },
@@ -94,8 +94,8 @@
       "confidence": 0.9317,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "The goalkeeper of the team that won the Champions League final last year (2022-23) wasolinero, as Manchester City won the final against Inter Milan with a score of 1-0, andolinero was the goalkeeper for Manchester City.",
-      "generate_hit": true,
+      "pred": "The goalkeeper of the team that won the Champions League final last year (2019-2020) was not mentioned, but Hugo Lloris was the goalkeeper for Tottenham, one of the teams in the final.",
+      "generate_hit": false,
       "chunks": 93
     },
     {
@@ -112,7 +112,7 @@
       "confidence": 0.9092,
       "passed_gate": true,
       "intent": "extract",
-      "pred": "Based on the sources, the song 'My Mind & Me' was released in 2022, but no specific songs from 2020 are mentioned.",
+      "pred": "A remix of \"Past Life\" by Lil Mosey was released on July 31, 2020.",
       "generate_hit": false,
       "chunks": 59
     },
@@ -129,8 +129,8 @@
       "retrieval_coverage": 0.5,
       "confidence": 0.4967,
       "passed_gate": true,
-      "intent": "lookup",
-      "pred": "The sources do not provide specific information about Austin Butler's most popular song. However, it is mentioned that Austin Butler sings several iconic Elvis Presley songs in the film, including \"I’ll Fly Away,\" \"That’s All Right,\" \"Baby, Let’s Play House,\" \"Blue Suede Shoes,\" \"Heartbreak Hotel,\" and others.",
+      "intent": "extract",
+      "pred": "Austin Butler's most popular song in the film Elvis, based on the sources provided, is not specified, but he sings several iconic songs including \"I’ll Fly Away,\" \"That’s All Right,\" \"Baby, Let’s Play House,\" \"Blue Suede Shoes,\" \"Heartbreak Hotel,\" \"Working on the Building\" (with Yola), \"Hound Dog,\" \"Are You Lonesome Tonight?,\" “Trouble,” “Crawfish,” “Here Comes Santa Claus,” “If I Can Dream,” “Suspicious Minds” and “Can’t Help Falling in Love.”",
       "generate_hit": false,
       "chunks": 63
     },
@@ -147,9 +147,9 @@
       "retrieval_coverage": 1.0,
       "confidence": 0.9987,
       "passed_gate": true,
-      "intent": "lookup",
-      "pred": "Usher won three awards at the 2023 Soul Train Awards.",
-      "generate_hit": false,
+      "intent": "extract",
+      "pred": "Usher won three Soul Train awards in 2023: best R&B/Soul male artist, certified soul award, and best collaboration with Summer Walker and 21 Savage.",
+      "generate_hit": true,
       "chunks": 87
     },
     {
@@ -166,7 +166,7 @@
       "confidence": 0.9431,
       "passed_gate": true,
       "intent": "extract",
-      "pred": "Cristiano Ronaldo has played for Manchester United, Real Madrid, and Juventus since 2010.",
+      "pred": "Cristiano Ronaldo has played for Real Madrid, Manchester United, and Juventus since 2010.",
       "generate_hit": true,
       "chunks": 87
     },
@@ -184,7 +184,7 @@
       "confidence": 0.4142,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "Microsoft has a higher opening stock price today (March 15, 2024) at 403.76 compared to yesterday (March 14, 2024) at 370.1920.",
+      "pred": "Microsoft has a higher closing stock price today (March 15, 2024) than the opening price yesterday (March 14, 2024).",
       "generate_hit": false,
       "chunks": 93
     },
@@ -202,7 +202,7 @@
       "confidence": 0.9959,
       "passed_gate": true,
       "intent": "compute",
-      "pred": "Billy Bob Thornton is 19 years older than Angelina Jolie.",
+      "pred": "The age difference between Angelina Jolie and Billy Bob Thornton is 20 years.",
       "generate_hit": true,
       "chunks": 50
     },
@@ -220,7 +220,7 @@
       "confidence": 0.233,
       "passed_gate": true,
       "intent": "compute",
-      "pred": "invalid question",
+      "pred": "The sources provided do not contain specific data on the number of movie tickets sold for action movies versus drama movies in the U.S. for the year 2023, so the question cannot be answered based on the given information.",
       "generate_hit": false,
       "chunks": 93
     },
@@ -238,7 +238,7 @@
       "confidence": 0.0006,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "I don't know",
+      "pred": "invalid question",
       "generate_hit": false,
       "chunks": 83
     },
@@ -257,7 +257,7 @@
       "passed_gate": false,
       "intent": "lookup",
       "pred": "I don't know",
-      "generate_hit": true,
+      "generate_hit": false,
       "chunks": 64
     },
     {
@@ -274,7 +274,7 @@
       "confidence": 0.9409,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "Amazon was the worst-performing FAANG stock of 2021, but Netflix is now the worst-performing stock in the S&P 500 as shares.",
+      "pred": "Amazon was the worst-performing FAANG stock of 2021 with a 2.4% stock climb, but as of the latest data, Netflix is the worst-performing stock in the S&P 500.",
       "generate_hit": false,
       "chunks": 72
     },
@@ -291,8 +291,8 @@
       "retrieval_coverage": 0.714,
       "confidence": 0.9886,
       "passed_gate": true,
-      "intent": "lookup",
-      "pred": "Paul Walker's last appearance in the 'Fast and Furious' franchise was in 'Fast and Furious 7'.",
+      "intent": "extract",
+      "pred": "Paul Walker's last scene was in the movie Furious 7.",
       "generate_hit": false,
       "chunks": 75
     },
@@ -328,7 +328,7 @@
       "confidence": 0.8609,
       "passed_gate": true,
       "intent": "extract",
-      "pred": "Blade Runner 2049 had higher box office earnings than Point Break, with a total of approximately $259.2 million, compared to no relevant box office information provided for Point Break in the sources.",
+      "pred": "The sources do not provide any information about the box office earnings of the movie \"Point Break\" in comparison to \"Blade Runner 2049.\" Therefore, based on the given sources, it is not possible to determine which movie had higher box office earnings between \"Blade Runner 2049\" and \"Point Break.\"",
       "generate_hit": false,
       "chunks": 64
     },
@@ -346,7 +346,7 @@
       "confidence": 0.5129,
       "passed_gate": true,
       "intent": "compute",
-      "pred": "The Denver Nuggets lost 7 of their home games during the time of 2023-01.",
+      "pred": "During the time of 2023-01, the Denver Nuggets lost 4 of their games as home team.",
       "generate_hit": true,
       "chunks": 78
     },
@@ -364,7 +364,7 @@
       "confidence": 0.1982,
       "passed_gate": true,
       "intent": "compute",
-      "pred": "Five migrations of lesser striped swallows would cover a total distance of 30000 miles.",
+      "pred": "Five migrations of lesser striped swallows would cover a total distance of 30,000 miles.",
       "generate_hit": false,
       "chunks": 72
     },
@@ -382,7 +382,7 @@
       "confidence": 0.3071,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "The last Super Bowl halftime performer was Rihanna for Super Bowl LVII, which took place in 2023, so Rihanna would have been around 41 years old at the time.",
+      "pred": "Rihanna is the last super bowl halftime performer, having performed in Super Bowl LVII in 2023.",
       "generate_hit": false,
       "chunks": 93
     },
@@ -400,7 +400,7 @@
       "confidence": 0.9678,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "Wild Wild West made approximately 222.1 million sales at the box office across the globe.",
+      "pred": "Wild Wild West made a total of $222,104,681 across the globe at the box office.",
       "generate_hit": false,
       "chunks": 71
     },
@@ -436,8 +436,8 @@
       "confidence": 0.9712,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "The total amount of dividends paid out by Devon Energy in 2023 was US$2.10 per share.",
-      "generate_hit": false,
+      "pred": "Devon Energy paid out a total dividend of US$2.10 per share to investors in 2023, but the total amount of dividends paid out by companies in the energy sector in 2023 is not provided in the sources.",
+      "generate_hit": true,
       "chunks": 87
     },
     {
@@ -454,7 +454,7 @@
       "confidence": 0.9975,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "Based on the sources, the 5 most spoken languages in the world are Mandarin Chinese, Hindi, Spanish, English, and Arabic.",
+      "pred": "The 5 most spoken languages in the world are English, Mandarin Chinese, Hindi, Spanish, and French.",
       "generate_hit": true,
       "chunks": 91
     },
@@ -472,7 +472,7 @@
       "confidence": 0.956,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "The Weeknd has more Spotify plays than Diplo, but he is not the most streamed artist globally compared to Taylor Swift.",
+      "pred": "The Weeknd has more Spotify plays than Diplo, but the most-streamed artist globally is Taylor Swift with over 26.1 billion global streams.",
       "generate_hit": true,
       "chunks": 84
     },
@@ -490,7 +490,7 @@
       "confidence": 0.2546,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "Zak Santiago and Brenda Crichlow played together in one movie, Cinema of the Abstract: Turbulence 3: Heavy Metal (2001).",
+      "pred": "Zak Santiago and Brenda Crichlow played together in one movie: Cinema of the Abstract: Turbulence 3: Heavy Metal (2001).",
       "generate_hit": true,
       "chunks": 69
     },
@@ -580,7 +580,7 @@
       "confidence": 0.9776,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "Meta had net acquisitions/divestitures of $-1.312B in 2022, indicating they had mergers or acquisitions that year.",
+      "pred": "Meta had net divestitures of $-1.312B in 2022, indicating some divestitures but no specific mergers or acquisitions are mentioned for that year.",
       "generate_hit": false,
       "chunks": 91
     },
@@ -598,7 +598,7 @@
       "confidence": 0.9964,
       "passed_gate": true,
       "intent": "extract",
-      "pred": "The question asks about the teams in Group C of the 2023-24 UEFA Champions League, but the provided sources do not specify which teams are in Group C. Therefore, based on the given information, I cannot provide a specific answer to which teams are part of Group C.",
+      "pred": "The question asks about the teams in group C of the 2023-24 UEFA Champions League, but the provided sources do not specify the teams in group C. The sources list some teams in the quarter-finals and round of 16, as well as the group stage teams, but do not detail the specific composition of group C.",
       "generate_hit": false,
       "chunks": 65
     },
@@ -616,7 +616,7 @@
       "confidence": 0.9189,
       "passed_gate": true,
       "intent": "extract",
-      "pred": "Tottenham ended the last EPL season with more points than Manchester United.",
+      "pred": "Tottenham ended the last EPL season with more points than Manchester United, having 53 points compared to Manchester United's 47 points.",
       "generate_hit": true,
       "chunks": 70
     },
@@ -633,9 +633,9 @@
       "retrieval_coverage": 1.0,
       "confidence": 0.9983,
       "passed_gate": true,
-      "intent": "lookup",
-      "pred": "Kelly Oubre Jr. has played for 6 teams.",
-      "generate_hit": false,
+      "intent": "compute",
+      "pred": "Kelly Oubre Jr. has played for 5 teams.",
+      "generate_hit": true,
       "chunks": 68
     },
     {
@@ -652,7 +652,7 @@
       "confidence": 0.9874,
       "passed_gate": true,
       "intent": "compute",
-      "pred": "Adele's album was number one on the Billboard 200 for approximately 19.23% of the year in 2016.",
+      "pred": "Adele's album was not number one on the Billboard 200 in 2016.",
       "generate_hit": false,
       "chunks": 86
     },
@@ -670,8 +670,8 @@
       "confidence": 0.9942,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "Olivia Colman played the role of Queen Elizabeth in the third season of the TV show \"The Crown\".",
-      "generate_hit": false,
+      "pred": "The actress who played the role of Queen Elizabeth in the third season of the TV show \"The Crown\" is Olivia Colman.",
+      "generate_hit": true,
       "chunks": 85
     },
     {
@@ -688,7 +688,7 @@
       "confidence": 0.9857,
       "passed_gate": true,
       "intent": "extract",
-      "pred": "The Rolling Stones currently consist of original members Mick Jagger and Keith Richards, along with late-joiner Ronnie Wood and Bill Wyman.",
+      "pred": "Who are the Rolling Stones members and where are they now? | The Rolling Stones currently consist of original members Mick Jagger and Keith Richards, along with late-joiner Ronnie Wood and Bill Wyman. Charlie Watts, a founding member and the drummer, passed away in 2021.",
       "generate_hit": false,
       "chunks": 85
     },
@@ -706,8 +706,8 @@
       "confidence": 0.6466,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "I don't know",
-      "generate_hit": true,
+      "pred": "God's Not Dead was the title originally chosen for the first movie in the series.",
+      "generate_hit": false,
       "chunks": 93
     },
     {
@@ -723,8 +723,8 @@
       "retrieval_coverage": 0.7,
       "confidence": 0.9475,
       "passed_gate": true,
-      "intent": "lookup",
-      "pred": "Beyoncé had embarked on seven concert tours by 2006, according to the sources provided.",
+      "intent": "compute",
+      "pred": "Beyoncé had gone on 4 tours by 2006.",
       "generate_hit": false,
       "chunks": 75
     },
@@ -760,7 +760,7 @@
       "confidence": 0.7251,
       "passed_gate": true,
       "intent": "lookup",
-      "pred": "International Tennis Federation and International Hockey Federation have the same number of members, both having 211 national and six regional associations.",
+      "pred": "The International Tennis Federation has 211 national and six regional associations as of 2016, which is more than the International Hockey Federation's membership, so the International Hockey Federation has a smaller membership.",
       "generate_hit": true,
       "chunks": 64
     },
@@ -778,8 +778,8 @@
       "confidence": 0.9881,
       "passed_gate": true,
       "intent": "compute",
-      "pred": "Ross Geller got divorced 3 times.",
-      "generate_hit": true,
+      "pred": "Ross Geller got divorced three times during the series Friends.",
+      "generate_hit": false,
       "chunks": 82
     }
   ]

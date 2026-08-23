@@ -1,0 +1,309 @@
+{
+  "generate_hit": 0.5,
+  "miss_n": 20,
+  "hit_n": 20,
+  "misses": [
+    {
+      "type": "simple",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "can you name the songs that selena gomez put out in 2020?",
+      "gold": "rare (live from the village studio), rare (alexander 23 edit), rare (deluxe album), 絕無僅有, lose you to love me (demo version), selena x votes",
+      "pred": "I don't know"
+    },
+    {
+      "type": "comparison",
+      "retr": false,
+      "corpus": false,
+      "abs": false,
+      "q": "does microsoft have higher opening stock price today or yesterday?",
+      "gold": "today feb 15 2024, microsoft open at the price of 408.07 which is the same opening price yesterday feb 14 2024",
+      "pred": "Microsoft has a lower opening stock price yesterday (March 11, 2024) compared to today (March 15, 2024)."
+    },
+    {
+      "type": "aggregation",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "what is the age difference between angelina jolie and billy bob thornton?",
+      "gold": "angelina jolie is 20 years younger than billy bob thornton.",
+      "pred": "The age difference between Angelina Jolie and Billy Bob Thornton is 19 years."
+    },
+    {
+      "type": "post-processing",
+      "retr": false,
+      "corpus": false,
+      "abs": false,
+      "q": "how many more ticket have been sold for action movies than drama movies in the us so far this year?",
+      "gold": "2,860,787 more",
+      "pred": "I don't know"
+    },
+    {
+      "type": "multi-hop",
+      "retr": false,
+      "corpus": false,
+      "abs": false,
+      "q": "what is the shortest highway in the us in feet?",
+      "gold": "the shortest highway in the us, i-878 in new york, is only 3,696 feet long.",
+      "pred": "I don't know"
+    },
+    {
+      "type": "false_premise",
+      "retr": false,
+      "corpus": null,
+      "abs": true,
+      "q": "how much is the worst performing stock, amazon?",
+      "gold": "invalid question",
+      "pred": "Amazon was the worst-performing stock among the FAANGs in 2021."
+    },
+    {
+      "type": "comparison",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "which movie had the higher box office earnings, blade runner 2049 or point break?",
+      "gold": "blade runner 2049 had a box office earnings, with a profit of $267.7 million, while point break earned $83.5 million.",
+      "pred": "invalid question"
+    },
+    {
+      "type": "aggregation",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "during the time of 2023-01, how many of their games as home team did denver nuggets lose?",
+      "gold": "1",
+      "pred": "During the time of 2023-01, the Denver Nuggets lost 4 of their games as home team."
+    },
+    {
+      "type": "post-processing",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "how long would it take for five migrations of lesser striped swallows?",
+      "gold": "the birds migrate south july/august und head back to the north between february/may. five migrations of this species would take anywhere between 3-5 years.",
+      "pred": "Five migrations of lesser striped swallows would take 30000 miles."
+    },
+    {
+      "type": "multi-hop",
+      "retr": false,
+      "corpus": false,
+      "abs": false,
+      "q": "how old is the last super bowl halftime performer?",
+      "gold": "usher is 45 years old.",
+      "pred": "Rihanna, the last Super Bowl halftime performer, performed in 2023."
+    },
+    {
+      "type": "simple_w_condition",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "what was the total amount of dividends paid out by companies in the energy sector in 2023?",
+      "gold": "the total amount of dividends paid out by companies in the energy sector in 2023 was $309.3 billion.",
+      "pred": "Devon Energy paid out a total dividend of US$2.10 per share in 2023."
+    },
+    {
+      "type": "comparison",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "which artist has the most spotify plays, the weeknd or diplo?",
+      "gold": "the weeknd",
+      "pred": "invalid question"
+    },
+    {
+      "type": "aggregation",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "how many movies did zak santiago and brenda crichlow play together?",
+      "gold": "3",
+      "pred": "Zak Santiago and Brenda Crichlow played together in 1 movie."
+    },
+    {
+      "type": "false_premise",
+      "retr": false,
+      "corpus": null,
+      "abs": true,
+      "q": "does neil degrasse tyson have a degree in astrophysics?",
+      "gold": "invalid question",
+      "pred": "Neil deGrasse Tyson has a degree in astrophysics."
+    },
+    {
+      "type": "simple_w_condition",
+      "retr": false,
+      "corpus": false,
+      "abs": false,
+      "q": "did meta have any mergers or acquistions in 2022?",
+      "gold": "meta acquired lofelt and presize in 2022.",
+      "pred": "Meta had net acquisitions/divestitures of $-1.312B in 2022."
+    },
+    {
+      "type": "set",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "what teams are part of group c in the 2023-24 uefa champions league?",
+      "gold": "real madrid, napoli, braga, union berlin",
+      "pred": "I don't know"
+    },
+    {
+      "type": "post-processing",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "what percentage of the year was adele's album number one on the billboard 200 in 2016?",
+      "gold": "~13% of the year",
+      "pred": "Adele's album \"25\" was at number one on the Billboard 200 for approximately 19.2% of the year 2016."
+    },
+    {
+      "type": "simple",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "tell me who are in the rolling stones?",
+      "gold": "ronnie wood, bill wyman, keith richards, dick taylor, brian jones, mick jagger, ian stewart, mick avory, charlie watts, tony chapman, mick taylor",
+      "pred": "The Rolling Stones members are Mick Jagger, Keith Richards, Ronnie Wood, and Bill Wyman. Additionally, Charlie Watts was a founding member and played drums until his passing."
+    },
+    {
+      "type": "simple_w_condition",
+      "retr": true,
+      "corpus": true,
+      "abs": false,
+      "q": "how many tours has beyoncé gone on by 2006?",
+      "gold": "beyoncé went on one tour herself and co-headlined an additional tour by 2006.",
+      "pred": "Beyoncé has gone on 2 tours by 2006."
+    },
+    {
+      "type": "comparison",
+      "retr": false,
+      "corpus": true,
+      "abs": false,
+      "q": "which sports organization has a smaller membership, international tennis federation or international hockey federation?",
+      "gold": "international hockey federation",
+      "pred": "invalid question"
+    }
+  ],
+  "hits": [
+    {
+      "type": "post-processing",
+      "q": "how many years older is khloé kardashian compared to her youngest sister?",
+      "gold": "khloé kardashian is 14 years older than her youngest sister, kylie.",
+      "pred": "Khloé Kardashian is 15 years older than her youngest sister Kylie Jenner."
+    },
+    {
+      "type": "multi-hop",
+      "q": "who was the goalkeeper of the team that won the champions league final last year?",
+      "gold": "ederson, who plays for manchester city, was the goalkeeper of the team that won the champions league final last year.",
+      "pred": "The goalkeeper of the team that won the Champions League final last year was Ederson Moraes."
+    },
+    {
+      "type": "false_premise",
+      "q": "what is austin butlers most popular song?",
+      "gold": "invalid question",
+      "pred": "I don't know"
+    },
+    {
+      "type": "simple_w_condition",
+      "q": "what soul train awards has usher won in year 2023",
+      "gold": "usher won three soul train awards in 2023: best r&b/soul male artist, best collaboration, and the soul train certified award.",
+      "pred": "Usher won three awards in 2023 Soul Train Awards."
+    },
+    {
+      "type": "set",
+      "q": "which clubs has cristiano ronaldo played for since 2010?",
+      "gold": "real madrid, juventus, manchester united, and al nassr are the clubs that cristiano ronaldo has played for since 2010.",
+      "pred": "Cristiano Ronaldo has played for Real Madrid and Juventus since 2010."
+    },
+    {
+      "type": "simple",
+      "q": "what is the price-to-earnings ratio of pmtu",
+      "gold": "i don't know",
+      "pred": "I don't know"
+    },
+    {
+      "type": "simple_w_condition",
+      "q": "what fast and furious movie was paul walker's last?",
+      "gold": "furious 7 marked the final film performance of paul walker",
+      "pred": "Paul Walker's last scene was in Furious 7."
+    },
+    {
+      "type": "set",
+      "q": "what are the four great lakes in michigan?",
+      "gold": "superior, michigan, huron and erie.",
+      "pred": "Michigan is framed by the Great Lakes Superior, Huron, Erie, and Michigan."
+    },
+    {
+      "type": "simple",
+      "q": "how many sales were made by wild wild west at the box office across the globe?",
+      "gold": "222104681",
+      "pred": "Wild Wild West made $222,104,681 across the globe at the box office."
+    },
+    {
+      "type": "false_premise",
+      "q": "when is selena gomez planning to launch her new upcoming podcast",
+      "gold": "invalid question",
+      "pred": "I don't know"
+    },
+    {
+      "type": "set",
+      "q": "what are the 5 most spoken languages in the world?",
+      "gold": "chinese, spanish, english, french, and hindi.",
+      "pred": "The 5 most spoken languages in the world are English, Mandarin Chinese, Hindi, Spanish, and French."
+    },
+    {
+      "type": "post-processing",
+      "q": "what's the area of this room that's 17 meters by 66 meters?",
+      "gold": "1122 square meters",
+      "pred": "1122 square meters"
+    },
+    {
+      "type": "multi-hop",
+      "q": "can you tell me the name of the actress who starred in the film that won the best picture oscar in 2018?",
+      "gold": "sally hawkins",
+      "pred": "The actress who starred in the film that won the best picture Oscar in 2018 is Sally Hawkins."
+    },
+    {
+      "type": "simple",
+      "q": "who is the oldest active player in the nba?",
+      "gold": "lebron james",
+      "pred": "The oldest active player in the NBA is LeBron James."
+    },
+    {
+      "type": "comparison",
+      "q": "which team ended the last epl season with more points, manchester united or tottenham?",
+      "gold": "manchester united",
+      "pred": "Tottenham ended the last EPL season with more points than Manchester United."
+    },
+    {
+      "type": "aggregation",
+      "q": "how many teams has kelly oubre jr. played for?",
+      "gold": "5",
+      "pred": "Kelly Oubre Jr. has played for 5 teams."
+    },
+    {
+      "type": "multi-hop",
+      "q": "what's the name of the actress who played the role of a queen in the third season of the tv show \"the crown\"?",
+      "gold": "the actress who played the role of a queen in the third season of the tv show \"the crown\" is olivia colman. for her portrayal of queen elizabeth ii, she received a golden globe award and a primetime emmy award.",
+      "pred": "Olivia Colman played the role of Queen Elizabeth in the third season of the TV show \"The Crown\"."
+    },
+    {
+      "type": "false_premise",
+      "q": "was god's not dead too the title originally chosen for that movie?",
+      "gold": "invalid question",
+      "pred": "I don't know"
+    },
+    {
+      "type": "set",
+      "q": "who were the producers of the bring it on movie?",
+      "gold": "the producers are marc abraham and thomas bliss",
+      "pred": "The producers of the Bring It On movie were Marc Abraham & Thomas Bliss."
+    },
+    {
+      "type": "aggregation",
+      "q": "how many times did ross geller get divorced?",
+      "gold": "3",
+      "pred": "Ross Geller got divorced 3 times."
+    }
+  ]
+}

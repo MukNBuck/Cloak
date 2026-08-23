@@ -55,17 +55,21 @@ INTENT_COMPARE_RE = re.compile(
 INTENT_EXTRACT_RE = re.compile(
     r"\b("
     r"list all|list the|extract|enumerate|tabulate|all of the|"
-    r"name the|which (clubs?|teams?|songs?|movies?|films?|awards?|members?|cities)|"
+    r"name the|can you name|tell me who|"
+    r"which .{0,24}(clubs?|teams?|songs?|movies?|films?|awards?|members?|cities)|"
     r"who (are|were) (the |in )|"
-    r"what (songs?|teams?|clubs?|movies?|awards?|members?)"
+    r"what (teams|songs|albums|members|clubs)|"
+    r"what .{0,40}(awards?|songs?|teams?|clubs?|movies?|films?|members?|tours?)"
     r")\b",
     re.I,
 )
 INTENT_COMPUTE_RE = re.compile(
     r"\b("
     r"how many years|how much (older|younger|more|less)|age difference|"
-    r"percentage|percent|what percent|how long would|area of|"
-    r"times (as )?(many|much)|compared to|how many more|how many (of|times)"
+    r"percentage|percent|what percent|percentage of the year|"
+    r"how long would|how long would it take|area of|"
+    r"times (as )?(many|much)|compared to|how many more|"
+    r"how many (of|times|tours|teams|movies|games|migrations)"
     r")\b",
     re.I,
 )

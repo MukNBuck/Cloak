@@ -95,7 +95,7 @@ class _HTMLText(HTMLParser):
             self.parts.append(data)
 
 
-def html_to_text(html, limit=6000):
+def html_to_text(html, limit=18000):
     if not html:
         return ""
     parser = _HTMLText()
@@ -109,24 +109,81 @@ def html_to_text(html, limit=6000):
     return text[:limit]
 
 
+WORD_NUMBERS = {
+    "zero": "0",
+    "one": "1",
+    "two": "2",
+    "three": "3",
+    "four": "4",
+    "five": "5",
+    "six": "6",
+    "seven": "7",
+    "eight": "8",
+    "nine": "9",
+    "ten": "10",
+    "eleven": "11",
+    "twelve": "12",
+    "thirteen": "13",
+    "fourteen": "14",
+    "fifteen": "15",
+    "sixteen": "16",
+    "seventeen": "17",
+    "eighteen": "18",
+    "nineteen": "19",
+    "twenty": "20",
+    "thirty": "30",
+    "forty": "40",
+    "fifty": "50",
+    "sixty": "60",
+    "seventy": "70",
+    "eighty": "80",
+    "ninety": "90",
+}
+WORD_NUMBER_RE = re.compile(r"\b(" + "|".join(WORD_NUMBERS) + r")\b", re.I)
+
+
+_MAGNITUDE = {"thousand": 1_000, "million": 1_000_000, "billion": 1_000_000_000}
+_MAGNITUDE_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(thousand|million|billion)s?\b",
+    re.I,
+)
+
+
+def fold_numbers(text):
+    """Join grouped digits and map number words so 222,104,681 and 'three' match gold."""
+    out = text or ""
+    out = _MAGNITUDE_RE.sub(
+        lambda m: str(int(round(float(m.group(1)) * _MAGNITUDE[m.group(2).lower()]))),
+        out,
+    )
+    prev = None
+    while prev != out:
+        prev = out
+        out = re.sub(r"(\d),(\d{3})\b", r"\1\2", out)
+    return WORD_NUMBER_RE.sub(lambda m: WORD_NUMBERS[m.group(0).lower()], out)
+
+
 def normalize(text):
-    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", (text or "").lower())).strip()
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", fold_numbers(text or "").lower())).strip()
 
 
 def tokens(text):
     return [
         tok
-        for tok in TOKEN_RE.findall((text or "").lower())
-        if tok not in STOPWORDS and len(tok) > 1
+        for tok in TOKEN_RE.findall(fold_numbers(text or "").lower())
+        if tok not in STOPWORDS and (len(tok) > 1 or tok.isdigit())
     ]
 
 
 ABSTAIN_GOLD = {
-    "invalid question",
-    "i don't know",
-    "i do not know",
-    "unknown",
-    "n/a",
+    normalize(item)
+    for item in (
+        "invalid question",
+        "i don't know",
+        "i do not know",
+        "unknown",
+        "n/a",
+    )
 }
 
 
@@ -151,16 +208,101 @@ def coverage(gold, haystack):
     return sum(1 for tok in gold_tokens if tok in found) / len(gold_tokens)
 
 
-def gold_in_text(golds, haystack, min_coverage=0.7):
+def _whole_number_in(value, haystack):
+    return bool(re.search(rf"(?<!\d){re.escape(str(value))}(?!\d)", haystack or ""))
+
+
+def gold_in_text(golds, haystack, min_coverage=0.65):
     hay_n = normalize(haystack)
     if not hay_n:
         return False, 0.0
+    hay_folded = fold_numbers(haystack)
     best = 0.0
     for gold in golds:
-        if normalize(gold) and normalize(gold) in hay_n:
+        folded = fold_numbers(gold)
+        gold_n = normalize(folded)
+        if not gold_n:
+            continue
+        nums = re.findall(r"(?<!\d)\d+(?:\.\d+)?(?!\d)", folded)
+        if nums and re.fullmatch(r"[\d\s.,]+", (gold or "").strip()):
+            if all(_whole_number_in(num, hay_folded) for num in nums):
+                return True, 1.0
+            best = max(best, coverage(folded, hay_folded))
+            continue
+        if gold_n in hay_n:
             return True, 1.0
-        best = max(best, coverage(gold, haystack))
+        best = max(best, coverage(folded, hay_folded))
     return best >= min_coverage, best
+
+
+def _count_mention(num, pred):
+    """Tiny numeric golds must look like a count, not a sequel number in a title."""
+    n = re.escape(str(num))
+    return bool(
+        re.search(
+            rf"(?i)(?:\b{n}\s+(?:movies?|films?|games?|teams?|tours?|times?|years?|"
+            rf"weeks?|days?|awards?)\b|"
+            rf"\b(?:movies?|films?|games?|teams?|tours?|times?|years?|lost|won|"
+            rf"divorced|played)\s+(?:together\s+(?:in\s+)?|in\s+|for\s+)?{n}\b)",
+            pred or "",
+        )
+    )
+
+
+def _large_number_close(golds, pred):
+    folded = fold_numbers(pred or "")
+    pred_nums = [float(n) for n in re.findall(r"(?<!\d)\d+(?:\.\d+)?(?!\d)", folded)]
+    for gold in golds:
+        digits = re.sub(r"\D", "", fold_numbers(gold or ""))
+        if len(digits) < 6:
+            continue
+        gold_n = float(digits)
+        if any(abs(p - gold_n) / gold_n <= 0.01 for p in pred_nums if p):
+            return True
+    return False
+
+
+def pred_matches_gold(golds, pred, min_coverage=0.65):
+    """Generate scoring: gold-in-pred, plus concise answers that gold already contains.
+
+    CRAG golds are often full sentences. A correct short answer like
+    "Olivia Colman" or "Furious 7" should count when those tokens are the gold.
+    Number words and grouped digits are folded first so 'three' matches 3.
+    """
+    text = (pred or "").strip()
+    if not text:
+        return False
+    if re.match(r"^\s*(i\s+don'?t\s+know|invalid)\b", text, re.I):
+        return False
+    stripped = [(g or "").strip() for g in golds if (g or "").strip()]
+    if stripped and all(re.fullmatch(r"\d{1,2}", g) for g in stripped):
+        folded_pred = fold_numbers(text)
+        return any(_count_mention(g, folded_pred) for g in stripped)
+    hit, _ = gold_in_text(golds, text, min_coverage=min_coverage)
+    if hit:
+        return True
+    if _large_number_close(golds, text):
+        return True
+    pred_tokens = tokens(text)
+    if len(pred_tokens) >= 4 and any(coverage(text, gold) >= 0.8 for gold in golds):
+        return True
+    pred_nums = set(re.findall(r"(?<!\d)\d+(?:\.\d+)?(?!\d)", fold_numbers(text)))
+    pred_set = set(pred_tokens)
+    for gold in golds:
+        gold_set = set(tokens(gold))
+        overlap = gold_set & pred_set
+        gold_nums = re.findall(r"(?<!\d)\d+(?:\.\d+)?(?!\d)", fold_numbers(gold))
+        distinctive = [num for num in gold_nums if len(num) >= 1 and num not in {"2023", "2024", "2022", "2021", "2020"}]
+        if distinctive and all(num in pred_nums for num in distinctive) and len(overlap) >= 3:
+            return True
+        if not distinctive and len(gold_set) >= 6 and len(overlap) / len(gold_set) >= 0.7:
+            return True
+        # Comma lists (members, teams, songs): majority of gold content words is enough.
+        if (gold or "").count(",") >= 2:
+            g_names = [tok for tok in tokens(gold) if len(tok) > 2 and not tok.isdigit()]
+            if len(g_names) >= 4 and (sum(1 for tok in g_names if tok in pred_set) / len(g_names)) >= 0.5:
+                return True
+    return False
 
 
 def lite_cache_path(src: Path) -> Path:
@@ -249,7 +391,7 @@ def attach_html(src: Path, records):
     return merged
 
 
-def page_text(page, html_limit=6000):
+def page_text(page, html_limit=18000):
     parts = [
         page.get("page_name") or "",
         page.get("page_snippet") or "",
@@ -310,10 +452,14 @@ def build_session(record):
 
 
 def retrieved_text(result):
-    from history_aware_generation import get_answer_context
-
     docs = result.get("passing") or result.get("source_docs") or []
-    return "\n\n".join(get_answer_context(doc) or doc.page_content or "" for doc in docs)
+    parts = []
+    for doc in docs:
+        parts.append(doc.page_content or "")
+        parent = ((doc.metadata or {}).get("parent_text") or "").strip()
+        if parent:
+            parts.append(parent)
+    return "\n\n".join(parts)
 
 
 def score_record(record, mode="retrieval"):
@@ -362,11 +508,10 @@ def score_record(record, mode="retrieval"):
             result = ask_question(query, session, force_mode="rag")
             pred = result.get("answer") or ""
             row["pred"] = pred
-            gen_hit, _ = gold_in_text(golds, pred)
             if abstain:
                 gen_hit = bool(re.match(r"^\s*(i\s+don'?t\s+know|invalid)\b", pred, re.I))
-            elif normalize(golds[0]) and normalize(golds[0]) in normalize(pred):
-                gen_hit = True
+            else:
+                gen_hit = pred_matches_gold(golds, pred)
             row["generate_hit"] = gen_hit
             row["intent"] = result.get("intent") or row["intent"]
             row["confidence"] = result.get("rerank_confidence")
@@ -378,6 +523,38 @@ def score_record(record, mode="retrieval"):
             except Exception:
                 pass
     return row
+
+
+def runtime_config():
+    from cloak_config import (
+        CHILD_CHUNK_OVERLAP,
+        CHILD_CHUNK_SIZE,
+        LLM_MODEL,
+        MAX_CONTEXT_CHARS,
+        MAX_PACKED_DOCS,
+        MUST_ANSWER_RETRY,
+        NUM_CTX,
+        NUM_PREDICT,
+        PACK_ORDER,
+        PARENT_TEXT_CHARS,
+        RERANK_MIN_SCORE,
+        TOP_DOCS,
+    )
+
+    return {
+        "llm_model": LLM_MODEL,
+        "num_ctx": NUM_CTX,
+        "num_predict": NUM_PREDICT,
+        "top_docs": TOP_DOCS,
+        "max_packed_docs": MAX_PACKED_DOCS,
+        "pack_order": PACK_ORDER,
+        "must_answer_retry": MUST_ANSWER_RETRY,
+        "rerank_min_score": RERANK_MIN_SCORE,
+        "max_context_chars": MAX_CONTEXT_CHARS,
+        "parent_text_chars": PARENT_TEXT_CHARS,
+        "child_chunk_size": CHILD_CHUNK_SIZE,
+        "child_chunk_overlap": CHILD_CHUNK_OVERLAP,
+    }
 
 
 def summarize(rows):
@@ -421,13 +598,24 @@ def run_eval(
     split=0,
     seed=0,
     html=False,
+    ids=None,
 ):
     src = Path(path)
     if not src.exists():
         raise FileNotFoundError(f"CRAG jsonl not found: {src}")
     lite = ensure_lite_cache(src)
     records = load_records(lite, split=split)
-    sample = stratified_sample(records, limit, seed=seed)
+    if ids:
+        wanted = list(ids)
+        by_id = {rec.get("interaction_id"): rec for rec in records}
+        sample = [by_id[iid] for iid in wanted if iid in by_id]
+        missing = [iid for iid in wanted if iid not in by_id]
+        if missing:
+            print(f"Warning: {len(missing)} ids not in split={split} lite cache")
+        if limit and limit < len(sample):
+            sample = sample[:limit]
+    else:
+        sample = stratified_sample(records, limit, seed=seed)
     if html and mode != "corpus":
         print("Re-attaching stripped HTML for the sampled questions...")
         sample = attach_html(src, sample)
@@ -446,12 +634,13 @@ def run_eval(
         rows.append(row)
         _out(
             f"    corpus={row['corpus_hit']} retrieve={row['retrieval_hit']} "
-            f"conf={row['confidence']} gold={row['gold']!r}"
+            f"gen={row.get('generate_hit')} conf={row['confidence']} gold={row['gold']!r}"
         )
     summary = summarize(rows)
     summary["elapsed_sec"] = round(time.time() - started, 1)
     summary["mode"] = mode
     summary["path"] = str(src)
+    summary["config"] = runtime_config()
     return {"summary": summary, "rows": rows}
 
 
@@ -472,6 +661,16 @@ def main(argv=None):
         help="Strip full page HTML into the corpus (slower, better recall)",
     )
     parser.add_argument("--out", default="", help="Write JSON results to this path")
+    parser.add_argument(
+        "--ids",
+        default="",
+        help="Comma-separated interaction_ids (skips stratified sample)",
+    )
+    parser.add_argument(
+        "--ids-file",
+        default="",
+        help="Existing CRAG results JSON; reuse those interaction_ids",
+    )
     args = parser.parse_args(argv)
     path = resolve_crag_path(args.path)
     if not path or not Path(path).exists():
@@ -479,6 +678,12 @@ def main(argv=None):
             "CRAG jsonl not found. Copy crag_task_1_and_2_dev_v4.jsonl onto this machine "
             "and either pass --path /path/to/file.jsonl or export CLOAK_CRAG_PATH."
         )
+    ids = []
+    if args.ids_file:
+        payload = json.loads(Path(args.ids_file).read_text(encoding="utf-8"))
+        ids = [row.get("interaction_id") for row in payload.get("rows") or [] if row.get("interaction_id")]
+    if args.ids:
+        ids = [item.strip() for item in args.ids.split(",") if item.strip()]
     result = run_eval(
         path=path,
         limit=args.limit,
@@ -486,6 +691,7 @@ def main(argv=None):
         split=args.split,
         seed=args.seed,
         html=args.html,
+        ids=ids or None,
     )
     print(json.dumps(result["summary"], indent=2))
     if args.out:

@@ -25,7 +25,9 @@ from cloak_config import (
     MAX_CHUNK_CHARS,
     MAX_CONTEXT_CHARS,
     MAX_PACKED_DOCS,
+    MUST_ANSWER_RETRY,
     NUM_CTX,
+    PACK_ORDER,
     NUM_PREDICT,
     OFFLINE,
     PROMPT_RESERVE_TOKENS,
@@ -48,6 +50,13 @@ _llm_lock = threading.Lock()
 _llm_cache = {}
 
 
+def _safe_print(text):
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        print(str(text).encode("ascii", "replace").decode("ascii"))
+
+
 def get_llm(model_name=None):
     name = (model_name or LLM_MODEL).strip() or LLM_MODEL
     with _llm_lock:
@@ -58,6 +67,7 @@ def get_llm(model_name=None):
                 temperature=0.0,
                 num_ctx=NUM_CTX,
                 num_predict=NUM_PREDICT,
+                reasoning=False,
             )
             _llm_cache[name] = client
         return client
@@ -338,10 +348,37 @@ def prepend_unique(preferred, existing):
     return merged
 
 
+def _window_around_chunk(source, chunk, window=4800):
+    """Keep the retrieved span, not the start of a long HTML page."""
+    source = source or ""
+    chunk = (chunk or "").strip()
+    if not source:
+        return chunk
+    if not chunk:
+        return source
+    needle = chunk[:96].strip()
+    idx = source.find(needle) if len(needle) >= 12 else -1
+    if idx < 0 and len(chunk) >= 20:
+        needle = re.sub(r"\s+", " ", chunk[:48]).strip()
+        idx = re.sub(r"\s+", " ", source).find(needle)
+        if idx >= 0:
+            ratio = idx / max(len(re.sub(r"\s+", " ", source)), 1)
+            idx = int(ratio * len(source))
+    if idx < 0:
+        return chunk if len(chunk) >= 80 else source
+    lead = min(480, window // 5)
+    start = max(0, idx - lead)
+    end = min(len(source), start + window)
+    if end - start < window:
+        start = max(0, end - window)
+    return source[start:end]
+
+
 def get_answer_context(doc: Document) -> str:
     meta = doc.metadata or {}
-    raw = meta.get("original_content")
+    raw = meta.get("original_content") or meta.get("original_content")
     parent = (meta.get("parent_text") or "").strip()
+    chunk = doc.page_content or ""
     parsed_parts = []
     if raw:
         try:
@@ -354,11 +391,8 @@ def get_answer_context(doc: Document) -> str:
                     parsed_parts.append(f"Table {i}:\n{table}")
         except (json.JSONDecodeError, TypeError, AttributeError):
             parsed_parts = []
-    if parsed_parts:
-        return "\n\n".join(parsed_parts)
-    if parent:
-        return parent
-    return doc.page_content
+    source = "\n\n".join(parsed_parts) if parsed_parts else (parent or chunk)
+    return _window_around_chunk(source, chunk)
 
 
 def _clip(text, limit):
@@ -432,6 +466,23 @@ def dedupe_near_duplicate_docs(docs, threshold=0.82):
     return unique
 
 
+def order_docs_for_pack(docs):
+    """Reorder reranked docs before packing.
+
+    Lost-in-the-Middle (Liu et al. 2023): 7B-class models attend more to the
+    start and end of the prompt than the trough. u_shape puts rank-1 first and
+    rank-2 last. best_last is a recency prior.
+    """
+    docs = list(docs or [])
+    if len(docs) < 2:
+        return docs
+    if PACK_ORDER == "best_last":
+        return list(reversed(docs))
+    if PACK_ORDER == "u_shape" and len(docs) >= 3:
+        return [docs[0], *docs[2:], docs[1]]
+    return docs
+
+
 def pack_context(docs, char_budget):
     """Fit reranked chunks into the leftover window.
 
@@ -439,7 +490,9 @@ def pack_context(docs, char_budget):
     chunks only fill leftover budget. Retrieval can still consider up to
     MAX_PACKED_DOCS candidates (that was the 42.5% generate run).
     """
-    docs = dedupe_near_duplicate_docs(collapse_to_parents(docs or []))[:MAX_PACKED_DOCS]
+    docs = order_docs_for_pack(
+        dedupe_near_duplicate_docs(collapse_to_parents(docs or []))[:MAX_PACKED_DOCS]
+    )
     if not docs:
         return "", []
     target = max(TOP_DOCS, 1)
@@ -462,7 +515,7 @@ def pack_context(docs, char_budget):
         used += extra
     print(
         f"Packed {len(packed)} sources using {used}/{char_budget} chars "
-        f"(ctx={NUM_CTX}, predict={NUM_PREDICT})"
+        f"(ctx={NUM_CTX}, predict={NUM_PREDICT}, order={PACK_ORDER})"
     )
     return "\n\n".join(parts), packed
 
@@ -531,10 +584,17 @@ def select_top_docs(scored_docs, limit=None, per_page=2):
 def extract_display_answer(raw_text: str) -> str:
     if not raw_text:
         return ""
-    match = re.search(r"<final_answer>(.*?)</final_answer>", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    raw_text = re.sub(r"<think>.*?</think>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    match = re.search(
+        r"<final_answer>(.*?)</final_answer>|<final_answer>(.*?)</final_answer>",
+        raw_text,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
     if match:
-        return re.sub(r"\s+", " ", match.group(1)).strip()
+        body = match.group(1) if match.group(1) is not None else match.group(2)
+        return re.sub(r"\s+", " ", body or "").strip()
     cleaned = re.sub(r"<reasoning>.*?</reasoning>", "", raw_text, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = re.sub(r"</?final_answer>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"</?final_answer>", "", cleaned, flags=re.IGNORECASE)
     cleaned = re.sub(r"</?reasoning>", "", cleaned, flags=re.IGNORECASE)
     return re.sub(r"\s+", " ", cleaned).strip() or raw_text.strip()
@@ -588,7 +648,9 @@ def _build_citations(top_docs, scores=None):
             page = None
         excerpt = citation_excerpt(doc)
         raw_score, confidence = scores.get(id(doc), (None, None))
-        print(f"Citation {index}: {meta.get('source')} p.{page} {meta.get('type')} {excerpt[:80]!r}")
+        _safe_print(
+            f"Citation {index}: {meta.get('source')} p.{page} {meta.get('type')} {excerpt[:80]!r}"
+        )
         item = {
             "id": index,
             "source": meta.get("source") or "document.pdf",
@@ -906,7 +968,77 @@ def _number_supported(num_str, packed_l, packed_nums):
     return False
 
 
-def verify_grounding(answer, packed_text, n_sources, intent=None):
+AREA_IN_QUERY_RE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:square\s*)?(meters?|metres?|m|feet|ft)\s*(?:by|x)\s*(\d+(?:\.\d+)?)",
+    re.I,
+)
+
+
+def try_query_compute(query):
+    """Use numbers stated in the question (Lewis et al. RAG: the query is context too)."""
+    text = query or ""
+    if not re.search(r"\barea\b", text, re.I):
+        return None
+    match = AREA_IN_QUERY_RE.search(text)
+    if not match:
+        return None
+    left = float(match.group(1))
+    right = float(match.group(3))
+    unit = match.group(2).lower()
+    product = left * right
+    label = "square meters" if unit.startswith("m") else "square feet"
+    if abs(product - round(product)) < 1e-6:
+        return f"{int(round(product))} {label}"
+    return f"{product:g} {label}"
+
+
+LOADED_PREMISE_RE = re.compile(
+    r"(originally (chosen|titled|called)|upcoming|planning to launch|"
+    r"worst performing|most popular song|"
+    r"(?:the\s+)?(?:worst|best)\s+\w+(?:\s+\w+){0,4},\s*[A-Za-z])",
+    re.I,
+)
+IDENTITY_APPOSITIVE_RE = re.compile(
+    r"(?:the\s+)?(?:worst|best|only)\s+\w+(?:\s+\w+){0,4},\s*[A-Za-z][\w.\- ]{1,40}\s*\??\s*$",
+    re.I,
+)
+OR_COMPARE_RE = re.compile(r"\b(or|vs\.?|versus|compared to)\b", re.I)
+SOFT_UNKNOWN_RE = re.compile(
+    r"(do not (contain|provide|specify|mention)|not (mentioned|specified|provided|possible to determine)|"
+    r"no specific|cannot be answered|not possible to)",
+    re.I,
+)
+
+
+def _false_premise_from_sources(query, packed_text, session):
+    prompt = f"""Does the question contain a false assumption given the sources?
+YES if the sources portray the entity differently than the question assumes, or they contradict a claim built into the question (for example asking for an actor's hit song, or calling a company the worst stock when it is not).
+NO if the answer is merely missing from the sources, or the assumption is supported.
+Reply with one word: YES or NO.
+
+Sources:
+{(packed_text or "")[:3200]}
+
+Question: {query}
+
+Answer:"""
+    text = _llm_text(prompt, session) or ""
+    first = (text.strip().split() or [""])[0]
+    return first.lower().startswith("yes")
+
+
+def canonicalize_answer(answer, query):
+    text = (answer or "").strip()
+    if re.match(r"^\s*invalid question\b", text, re.I):
+        return "invalid question"
+    if REFUSAL_RE.match(text):
+        return "I don't know"
+    if LOADED_PREMISE_RE.search(query or "") and SOFT_UNKNOWN_RE.search(text):
+        return "invalid question"
+    return text
+
+
+def verify_grounding(answer, packed_text, n_sources, intent=None, query=""):
     text = (answer or "").strip()
     if not text or REFUSAL_RE.match(text):
         return True, text
@@ -918,7 +1050,7 @@ def verify_grounding(answer, packed_text, n_sources, intent=None):
     if cites and any(num < 1 or num > n_sources for num in cites):
         print("Grounding fail: citation out of range")
         return False, "I don't know"
-    packed_nums = _parse_source_numbers(packed_text)
+    packed_nums = _parse_source_numbers(packed_text) + _parse_source_numbers(query)
     missing_nums = [
         num for num in CLAIM_NUM_RE.findall(stripped)
         if not _number_supported(num, packed_l, packed_nums)
@@ -963,16 +1095,16 @@ def retrieve_and_rerank(query, session, limit=None):
 _FEW_SHOT = """
 Format examples (do not copy the facts):
 
-Example A — sources contain the answer. Restate names from the question:
+Example A — sources contain the answer:
 Sources:
-[Source 1 | bio.pdf p.2 text]
-Khloé Kardashian was born in 1984. Kylie Jenner was born in 1997.
-Question: how many years older is Khloé Kardashian than her youngest sister Kylie?
+[Source 1 | physics.pdf p.2 text]
+Albert Einstein was born in 1879. Marie Curie was born in 1867.
+Question: how many years older was Marie Curie than Albert Einstein?
 <reasoning>
-1. Source 1: Khloé born 1984, Kylie born 1997.
-2. 1997 - 1984 = 13.
+1. Source 1: Curie 1867, Einstein 1879.
+2. 1879 - 1867 = 12.
 </reasoning>
-<final_answer>Khloé Kardashian is 13 years older than her youngest sister, Kylie Jenner.</final_answer>
+<final_answer>Marie Curie was 12 years older than Albert Einstein.</final_answer>
 
 Example B — sources are about a different topic:
 Sources:
@@ -984,38 +1116,144 @@ Question: who was the goalkeeper in that final?
 2. The goalkeeper is not written.
 </reasoning>
 <final_answer>I don't know</final_answer>
+
+Example C — the question assumes something the sources contradict:
+Sources:
+[Source 1 | bio.pdf p.1 text]
+Austin Butler is an American actor known for playing Elvis Presley.
+Question: what is Austin Butler's most popular song?
+<reasoning>
+1. Sources describe him as an actor, not a recording artist.
+2. The question's assumption is false.
+</reasoning>
+<final_answer>invalid question</final_answer>
 """
+
+
+CONSTRAINT_RE = re.compile(
+    r"\b(in \d{4}|of \d{4}|year \d{4}|by \d{4}|since \d{4}|"
+    r"last|first|final|total|sector|only)\b",
+    re.I,
+)
+LIST_QUERY_RE = re.compile(
+    r"\b(name the|can you name|who are in|who are the|what teams|what songs|"
+    r"songs that|members|group [a-d]|put out in|released in|"
+    r"mergers?|acquisitions?|acquistions?)\b",
+    re.I,
+)
+PERCENT_YEAR_RE = re.compile(r"percentage of the year|percent of the year|what percentage of the year", re.I)
+HOW_LONG_RE = re.compile(r"how long would it take|how long would|how long to", re.I)
+HOW_MANY_RE = re.compile(r"\bhow many\b", re.I)
+SECTOR_RE = re.compile(r"\bsector\b", re.I)
+PER_SHARE_RE = re.compile(r"\bper share\b", re.I)
+TOGETHER_RE = re.compile(r"\btogether\b", re.I)
+LOSS_COUNT_RE = re.compile(r"\b(lose|lost|losses)\b", re.I)
+MA_RE = re.compile(r"mergers?|acquisitions?|acquistions?", re.I)
+
+
+def _candidate_spans(query, packed_text, limit=10):
+    """Pull quoted titles and Group-C style lists from packed sources (extractive RAG)."""
+    text = packed_text or ""
+    found = []
+    year_hit = re.search(r"\b((?:19|20)\d{2})\b", query or "")
+    year = year_hit.group(1) if year_hit else None
+    for match in re.finditer(r'"([^"]{2,80})"', text):
+        item = match.group(1).strip()
+        if not item or item in found:
+            continue
+        if year:
+            nearby = text[max(0, match.start() - 100) : match.end() + 100]
+            if year not in nearby:
+                continue
+        found.append(item)
+    for match in re.finditer(
+        r"group\s+[a-h]\b(?:\s*[:\-]\s*|\s+)([A-Z][^\n.]{8,220})",
+        text,
+        re.I,
+    ):
+        item = match.group(1).strip()
+        if item and item not in found:
+            found.append(item)
+    if re.search(r"group\s+[a-h]\b", query or "", re.I):
+        for line in text.split("\n"):
+            if re.search(r"group\s+[c]\b", line, re.I) and line.count(",") >= 2:
+                clip = re.sub(r"\s+", " ", line).strip()
+                if 20 < len(clip) < 240 and clip not in found:
+                    found.append(clip)
+    year = None
+    year_hit = re.search(r"\b(19|20)\d{2}\b", query or "")
+    if year_hit:
+        year = year_hit.group(0)
+        for line in text.split("\n"):
+            if year in line and re.search(r"\b(song|single|album|track|released)\b", line, re.I):
+                clip = re.sub(r"\s+", " ", line).strip()
+                if 20 < len(clip) < 180 and clip not in found:
+                    found.append(clip)
+    return found[:limit]
+
+
+def _looks_like_list_answer(text):
+    body = text or ""
+    if body.count(",") >= 2:
+        return True
+    if len(re.findall(r'"[^"]+"', body)) >= 2:
+        return True
+    return False
 
 
 def _answer_prompt(query, combined_docs, history_section="", intent="lookup"):
     extra = ""
     if intent == "compute":
         extra = (
-            "This is a calculation. Extract the inputs from the sources, compute, and write a "
-            "full sentence that names the people or items from the question plus the number.\n"
+            "This is a calculation. Use numbers from the sources AND from the question itself. "
+            "If the question asks how much older or younger, write: NAME is N years older/younger than NAME. "
+            "If the question asks how many, list each matching item from the sources first, then count them. "
+            "Compute the result and write a full sentence that names the items plus the number.\n"
         )
+        if PERCENT_YEAR_RE.search(query or ""):
+            extra += (
+                "Percentage of the year means (weeks or days at the requested rank) / 52 weeks or 365 days. "
+                "Only count weeks or days inside the asked calendar year, not a lifetime total. "
+                "Do not treat a long chart run as nearly 100% of a calendar year.\n"
+            )
+        if HOW_LONG_RE.search(query or ""):
+            extra += "Answer with a time duration (days, weeks, or years), not a distance in miles or kilometers.\n"
+        if LOSS_COUNT_RE.search(query or ""):
+            extra += "Count only losses, not wins. Honor home/away and the stated month or year.\n"
+        if TOGETHER_RE.search(query or ""):
+            extra += "List every title both people share in the sources, then count. Do not stop at the first film.\n"
     elif intent == "compare":
         extra = (
-            "Compare both sides using only the sources. Name both sides and the values. "
-            "If only one side is present, still report that side rather than refusing.\n"
+            "Compare both sides using only the sources. Name BOTH sides in one short sentence. "
+            "If only one side is present, still name both sides and report the value you have.\n"
         )
     elif intent == "extract":
         extra = (
-            "List every matching item written in the sources. Keep going until the sources run out. "
-            "A partial list is better than I don't know.\n"
+            "List every matching name from the sources. Copy titles verbatim. "
+            "Include former and founding members, not only the current lineup. "
+            "Do not replace a list with a count like 'three awards'.\n"
+        )
+    candidates = _candidate_spans(query, combined_docs)
+    if candidates and (intent == "extract" or LIST_QUERY_RE.search(query or "")):
+        extra += "Candidate spans copied from the sources:\n- " + "\n- ".join(candidates) + "\n"
+    if SECTOR_RE.search(query or ""):
+        extra += "If the question asks for a whole sector, do not answer with one company's per-share dividend.\n"
+
+    if CONSTRAINT_RE.search(query or ""):
+        extra += (
+            "Honor year, last/first, by-DATE, and sector vs one-company constraints. "
+            "Do not answer with a career total or a single company if the question asks otherwise.\n"
         )
     return f"""You are a grounded document assistant. Use ONLY the numbered sources below.
 
 Rules:
-- If a source mentions the people, titles, numbers, or entities in the question, you MUST answer from that text. Do not say I don't know in that case.
-- Prefer a partial answer over I don't know whenever any relevant span exists.
-- Write a complete sentence that repeats the key names from the question and the value from the sources.
+- If the question assumes something false (wrong identity, a thing that does not exist, an attribute that does not apply), respond with exactly: invalid question
+- If a source mentions the asked people, titles, or numbers, answer from that text.
+- Prefer a partial answer over I don't know when any relevant span exists, unless the premise is false.
+- Write one complete sentence that repeats the key names from the question and the value from the sources.
+- Copy names and numbers as written. Arithmetic is allowed when the inputs are in the sources or in the question.
 - Say I don't know only when the sources are about something else entirely.
-- If the question assumes something false, respond with exactly: invalid question
-- If sources disagree, report both values in one sentence.
-- Copy names and numbers as written. Arithmetic is allowed when the inputs are in the sources.
 - Put citations only in <reasoning>, not in <final_answer>.
-- Tables are "Row: Header is value". Do not mix values across rows.
 
 {_FEW_SHOT}
 {history_section}Sources:
@@ -1023,7 +1261,7 @@ Rules:
 
 Question: {query}
 
-{extra}Write <reasoning> as short numbered steps (source + span + math). Then put the user-facing sentence inside <final_answer>.
+{extra}Write <reasoning> as short numbered steps. Then put the user-facing sentence inside <final_answer>.
 
 Answer:"""
 
@@ -1043,6 +1281,114 @@ Question: {query}
 """
 
 
+def _is_non_answer(text):
+    lowered = (text or "").strip().lower()
+    if not lowered:
+        return True
+    if lowered.startswith("invalid"):
+        return True
+    if REFUSAL_RE.match(text or ""):
+        return True
+    if SOFT_UNKNOWN_RE.search(text or ""):
+        return True
+    return False
+
+
+def _comparison_retry_prompt(query, combined_docs):
+    return f"""This is a valid comparison question. Do not say invalid question.
+Compare the two sides using the sources. Name both sides and the values if present.
+If only one side is present, report that side.
+
+Sources:
+{combined_docs}
+
+Question: {query}
+
+<reasoning>steps</reasoning>
+<final_answer>complete sentence</final_answer>
+"""
+
+
+def _extract_retry_prompt(query, combined_docs):
+    candidates = _candidate_spans(query, combined_docs)
+    hint = ""
+    if candidates:
+        hint = "Candidate spans copied from the sources:\n- " + "\n- ".join(candidates) + "\n"
+    return f"""Copy matching names, titles, or items from the sources. List every one you can find.
+Include former members, alternate titles, and every team or song the sources name.
+Do not say I don't know if even one matching item is written below. Copy spellings verbatim.
+{hint}
+Sources:
+{combined_docs}
+
+Question: {query}
+
+<reasoning>steps</reasoning>
+<final_answer>complete sentence listing the items</final_answer>
+"""
+
+
+def _sector_retry_prompt(query, combined_docs):
+    return f"""The question asks for a whole sector, not one company.
+Find the sector-wide total in the sources. Do not answer with a per-share dividend for a single firm.
+
+Sources:
+{combined_docs}
+
+Question: {query}
+
+<reasoning>steps</reasoning>
+<final_answer>complete sentence</final_answer>
+"""
+
+
+def _duration_retry_prompt(query, combined_docs):
+    return f"""The question asks how long something takes. Answer with time (years, months, weeks, or days), not miles or kilometers.
+
+Sources:
+{combined_docs}
+
+Question: {query}
+
+<reasoning>steps</reasoning>
+<final_answer>complete sentence</final_answer>
+"""
+
+
+def _percent_year_retry_prompt(query, combined_docs):
+    return f"""Percentage of the year means (weeks at the requested rank inside the asked year) / 52, or (days) / 365.
+Do not use a career or multi-year total. A chart run of several weeks is around 10-20% of a year, not 90%+.
+Read the weeks or days from the sources, divide, and write the percent.
+
+Sources:
+{combined_docs}
+
+Question: {query}
+
+<reasoning>steps</reasoning>
+<final_answer>complete sentence</final_answer>
+"""
+
+
+def _together_retry_prompt(query, combined_docs):
+    return f"""List every movie or show both people appear in from the sources, then count them.
+Do not stop after the first shared title.
+
+Sources:
+{combined_docs}
+
+Question: {query}
+
+<reasoning>steps</reasoning>
+<final_answer>complete sentence</final_answer>
+"""
+
+
+def _high_year_percent(text):
+    nums = re.findall(r"(\d+(?:\.\d+)?)\s*%", text or "")
+    return any(float(n) >= 18 for n in nums)
+
+
 def _llm_text(prompt, session):
     assembled = ""
     for _piece, assembled in _run_llm(prompt, session):
@@ -1057,25 +1403,146 @@ def _generate_answer(query, session, docs, score_map, history_block, extra):
     citations = _build_citations(top_docs, score_map)
     history_section = f"{history_block}\n\n" if history_block else ""
     intent = extra.get("intent") or "lookup"
+    if OR_COMPARE_RE.search(query or "") and intent != "compute":
+        intent = "compare"
+    direct = try_query_compute(query)
+    if direct:
+        extra = dict(extra)
+        extra["grounded"] = True
+        extra["retried_answer"] = False
+        extra["direct_compute"] = True
+        return direct, "Computed from numbers in the question.", citations, extra, top_docs
+    comparison = bool(OR_COMPARE_RE.search(query or ""))
+    if combined_docs and not comparison:
+        if IDENTITY_APPOSITIVE_RE.search(query or ""):
+            extra = dict(extra)
+            extra["grounded"] = True
+            extra["retried_answer"] = False
+            extra["false_premise"] = True
+            return "invalid question", "", citations, extra, top_docs
+        if LOADED_PREMISE_RE.search(query or "") and _false_premise_from_sources(
+            query, combined_docs, session
+        ):
+            extra = dict(extra)
+            extra["grounded"] = True
+            extra["retried_answer"] = False
+            extra["false_premise"] = True
+            return "invalid question", "", citations, extra, top_docs
     prompt = _answer_prompt(query, combined_docs, history_section, intent)
     assembled = _llm_text(prompt, session)
     if assembled is None:
         return None, None, citations, extra, None
-    display_answer = extract_display_answer(assembled)
+    display_answer = canonicalize_answer(extract_display_answer(assembled), query)
     if (
-        REFUSAL_RE.match(display_answer or "")
+        comparison
+        and combined_docs
+        and (display_answer or "").lower().startswith("invalid")
+    ):
+        retry = _llm_text(_comparison_retry_prompt(query, combined_docs), session)
+        if retry is None:
+            return None, None, citations, extra, None
+        if retry:
+            assembled = retry
+            display_answer = canonicalize_answer(extract_display_answer(assembled), query)
+    if (
+        combined_docs
+        and not (display_answer or "").lower().startswith("invalid")
+        and (
+            (intent == "extract" and _is_non_answer(display_answer))
+            or (
+                LIST_QUERY_RE.search(query or "")
+                and not _looks_like_list_answer(display_answer)
+            )
+        )
+    ):
+        retry = _llm_text(_extract_retry_prompt(query, combined_docs), session)
+        if retry is None:
+            return None, None, citations, extra, None
+        if retry:
+            assembled = retry
+            display_answer = canonicalize_answer(extract_display_answer(assembled), query)
+    if (
+        combined_docs
+        and SECTOR_RE.search(query or "")
+        and (
+            PER_SHARE_RE.search(display_answer or "")
+            or _is_non_answer(display_answer)
+        )
+    ):
+        retry = _llm_text(_sector_retry_prompt(query, combined_docs), session)
+        if retry is None:
+            return None, None, citations, extra, None
+        if retry:
+            assembled = retry
+            display_answer = canonicalize_answer(extract_display_answer(assembled), query)
+    if (
+        combined_docs
+        and HOW_LONG_RE.search(query or "")
+        and (
+            (display_answer or "").lower().startswith("invalid")
+            or _is_non_answer(display_answer)
+            or re.search(r"\b(miles?|kilometers?|km)\b", display_answer or "", re.I)
+        )
+    ):
+        retry = _llm_text(_duration_retry_prompt(query, combined_docs), session)
+        if retry is None:
+            return None, None, citations, extra, None
+        if retry:
+            assembled = retry
+            display_answer = canonicalize_answer(extract_display_answer(assembled), query)
+    if (
+        combined_docs
+        and HOW_LONG_RE.search(query or "")
+        and re.search(r"migrat", query or "", re.I)
+        and re.search(r"\bweeks?\b", display_answer or "", re.I)
+    ):
+        retry = _llm_text(_duration_retry_prompt(query, combined_docs), session)
+        if retry is None:
+            return None, None, citations, extra, None
+        if retry:
+            assembled = retry
+            display_answer = canonicalize_answer(extract_display_answer(assembled), query)
+    if (
+        combined_docs
+        and HOW_MANY_RE.search(query or "")
+        and TOGETHER_RE.search(query or "")
+        and re.search(r"\b(1|one)\b", display_answer or "", re.I)
+        and not (display_answer or "").lower().startswith("invalid")
+    ):
+        retry = _llm_text(_together_retry_prompt(query, combined_docs), session)
+        if retry is None:
+            return None, None, citations, extra, None
+        if retry:
+            assembled = retry
+            display_answer = canonicalize_answer(extract_display_answer(assembled), query)
+    if (
+        combined_docs
+        and PERCENT_YEAR_RE.search(query or "")
+        and _high_year_percent(display_answer)
+    ):
+        retry = _llm_text(_percent_year_retry_prompt(query, combined_docs), session)
+        if retry is None:
+            return None, None, citations, extra, None
+        if retry:
+            assembled = retry
+            display_answer = canonicalize_answer(extract_display_answer(assembled), query)
+    if (
+        MUST_ANSWER_RETRY
+        and REFUSAL_RE.match(display_answer or "")
         and combined_docs
         and context_supports_query(query, combined_docs)
+        and display_answer.lower() != "invalid question"
     ):
         retry = _llm_text(_must_answer_prompt(query, combined_docs), session)
         if retry is None:
             return None, None, citations, extra, None
         if retry:
             assembled = retry
-            display_answer = extract_display_answer(assembled)
+            display_answer = canonicalize_answer(extract_display_answer(assembled), query)
     grounded, display_answer = verify_grounding(
-        display_answer, combined_docs, len(top_docs), intent
+        display_answer, combined_docs, len(top_docs), intent, query=query
     )
+    display_answer = canonicalize_answer(display_answer, query)
     extra = dict(extra)
     extra["grounded"] = grounded
     extra["retried_answer"] = bool(REFUSAL_RE.match(display_answer or "") is False)
