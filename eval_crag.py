@@ -359,7 +359,7 @@ def score_record(record, mode="retrieval"):
         row["confidence"] = round(float(retrieval.get("top_confidence") or 0.0), 4)
         row["passed_gate"] = bool(retrieval.get("passing"))
         if mode == "generate":
-            result = ask_question(query, session)
+            result = ask_question(query, session, force_mode="rag")
             pred = result.get("answer") or ""
             row["pred"] = pred
             gen_hit, _ = gold_in_text(golds, pred)

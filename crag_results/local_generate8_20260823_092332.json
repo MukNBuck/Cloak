@@ -1,0 +1,210 @@
+{
+  "summary": {
+    "n": 8,
+    "corpus_hit": 0.857,
+    "retrieval_hit": 0.625,
+    "retrieval_hit_when_in_corpus": 0.833,
+    "generate_hit": 0.125,
+    "gate_pass_rate": 0.625,
+    "mean_confidence": 0.758,
+    "by_question_type": {
+      "aggregation": {
+        "n": 1,
+        "corpus_hit": 1.0,
+        "retrieval_hit": 1.0,
+        "generate_hit": 0.0
+      },
+      "comparison": {
+        "n": 1,
+        "corpus_hit": 0.0,
+        "retrieval_hit": 0.0,
+        "generate_hit": 0.0
+      },
+      "false_premise": {
+        "n": 1,
+        "corpus_hit": null,
+        "retrieval_hit": 0.0,
+        "generate_hit": 1.0
+      },
+      "multi-hop": {
+        "n": 1,
+        "corpus_hit": 1.0,
+        "retrieval_hit": 0.0,
+        "generate_hit": 0.0
+      },
+      "post-processing": {
+        "n": 1,
+        "corpus_hit": 1.0,
+        "retrieval_hit": 1.0,
+        "generate_hit": 0.0
+      },
+      "set": {
+        "n": 1,
+        "corpus_hit": 1.0,
+        "retrieval_hit": 1.0,
+        "generate_hit": 0.0
+      },
+      "simple": {
+        "n": 1,
+        "corpus_hit": 1.0,
+        "retrieval_hit": 1.0,
+        "generate_hit": 0.0
+      },
+      "simple_w_condition": {
+        "n": 1,
+        "corpus_hit": 1.0,
+        "retrieval_hit": 1.0,
+        "generate_hit": 0.0
+      }
+    },
+    "elapsed_sec": 77.1,
+    "mode": "generate",
+    "path": "e:\\crag_task_1_and_2_dev_v4.jsonl\\crag_task_1_and_2_dev_v4.jsonl"
+  },
+  "rows": [
+    {
+      "interaction_id": "e1c2208c-e2f0-42b4-8d29-685c32cde2c8",
+      "domain": "open",
+      "question_type": "post-processing",
+      "query": "how many years older is khloé kardashian compared to her youngest sister?",
+      "gold": "khloé kardashian is 14 years older than her youngest sister, kylie.",
+      "abstain": false,
+      "corpus_hit": true,
+      "corpus_coverage": 1.0,
+      "retrieval_hit": true,
+      "retrieval_coverage": 1.0,
+      "confidence": 0.3743,
+      "passed_gate": false,
+      "intent": "compute",
+      "pred": "I don't know",
+      "generate_hit": false,
+      "chunks": 93
+    },
+    {
+      "interaction_id": "4835d4a2-4f31-423b-9f82-4c879c7798ed",
+      "domain": "sports",
+      "question_type": "multi-hop",
+      "query": "who was the goalkeeper of the team that won the champions league final last year?",
+      "gold": "ederson, who plays for manchester city, was the goalkeeper of the team that won the champions league final last year.",
+      "abstain": false,
+      "corpus_hit": true,
+      "corpus_coverage": 0.769,
+      "retrieval_hit": false,
+      "retrieval_coverage": 0.615,
+      "confidence": 0.9317,
+      "passed_gate": true,
+      "intent": "lookup",
+      "pred": "Alisson",
+      "generate_hit": false,
+      "chunks": 93
+    },
+    {
+      "interaction_id": "df1acadd-4855-40bc-997b-eb37595ea759",
+      "domain": "music",
+      "question_type": "simple",
+      "query": "can you name the songs that selena gomez put out in 2020?",
+      "gold": "rare (live from the village studio), rare (alexander 23 edit), rare (deluxe album), 絕無僅有, lose you to love me (demo version), selena x votes",
+      "abstain": false,
+      "corpus_hit": true,
+      "corpus_coverage": 0.842,
+      "retrieval_hit": true,
+      "retrieval_coverage": 0.737,
+      "confidence": 0.9092,
+      "passed_gate": true,
+      "intent": "lookup",
+      "pred": "I don't know.",
+      "generate_hit": false,
+      "chunks": 59
+    },
+    {
+      "interaction_id": "1b1a3e0e-5725-4c5c-822c-3c5e06b1d16c",
+      "domain": "open",
+      "question_type": "false_premise",
+      "query": "what is austin butlers most popular song?",
+      "gold": "invalid question",
+      "abstain": true,
+      "corpus_hit": null,
+      "corpus_coverage": null,
+      "retrieval_hit": false,
+      "retrieval_coverage": 0.5,
+      "confidence": 0.4967,
+      "passed_gate": false,
+      "intent": "lookup",
+      "pred": "I don't know",
+      "generate_hit": true,
+      "chunks": 63
+    },
+    {
+      "interaction_id": "af5cbdb5-6925-423f-9115-63ef48a16348",
+      "domain": "open",
+      "question_type": "simple_w_condition",
+      "query": "what soul train awards has usher won in year 2023",
+      "gold": "usher won three soul train awards in 2023: best r&b/soul male artist, best collaboration, and the soul train certified award.",
+      "abstain": false,
+      "corpus_hit": true,
+      "corpus_coverage": 1.0,
+      "retrieval_hit": true,
+      "retrieval_coverage": 1.0,
+      "confidence": 0.9987,
+      "passed_gate": true,
+      "intent": "lookup",
+      "pred": "I don't know.",
+      "generate_hit": false,
+      "chunks": 87
+    },
+    {
+      "interaction_id": "d1ccf4bf-0507-429c-a7d3-b5d5eefd14c3",
+      "domain": "sports",
+      "question_type": "set",
+      "query": "which clubs has cristiano ronaldo played for since 2010?",
+      "gold": "real madrid, juventus, manchester united, and al nassr are the clubs that cristiano ronaldo has played for since 2010.",
+      "abstain": false,
+      "corpus_hit": true,
+      "corpus_coverage": 1.0,
+      "retrieval_hit": true,
+      "retrieval_coverage": 1.0,
+      "confidence": 0.9431,
+      "passed_gate": true,
+      "intent": "lookup",
+      "pred": "Cristiano Ronaldo has played for Real Madrid and Juventus since 2010.",
+      "generate_hit": false,
+      "chunks": 87
+    },
+    {
+      "interaction_id": "8d409639-bbae-4f62-a5fc-71a7ee5b8f80",
+      "domain": "finance",
+      "question_type": "comparison",
+      "query": "does microsoft have higher opening stock price today or yesterday?",
+      "gold": "today feb 15 2024, microsoft open at the price of 408.07 which is the same opening price yesterday feb 14 2024",
+      "abstain": false,
+      "corpus_hit": false,
+      "corpus_coverage": 0.562,
+      "retrieval_hit": false,
+      "retrieval_coverage": 0.562,
+      "confidence": 0.4142,
+      "passed_gate": false,
+      "intent": "lookup",
+      "pred": "I don't know",
+      "generate_hit": false,
+      "chunks": 93
+    },
+    {
+      "interaction_id": "8de42dd9-cf5b-4648-8d6a-07898d027c30",
+      "domain": "open",
+      "question_type": "aggregation",
+      "query": "what is the age difference between angelina jolie and billy bob thornton?",
+      "gold": "angelina jolie is 20 years younger than billy bob thornton.",
+      "abstain": false,
+      "corpus_hit": true,
+      "corpus_coverage": 0.778,
+      "retrieval_hit": true,
+      "retrieval_coverage": 0.778,
+      "confidence": 0.9959,
+      "passed_gate": true,
+      "intent": "compute",
+      "pred": "20 years",
+      "generate_hit": false,
+      "chunks": 50
+    }
+  ]
+}

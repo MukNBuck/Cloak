@@ -41,6 +41,8 @@ from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_ollama import ChatOllama
 
+from route import classify_intent, decide_route, route_label
+
 _DEVICE = torch_device()
 _llm_lock = threading.Lock()
 _llm_cache = {}
@@ -398,13 +400,46 @@ def source_char_budget(query, history_block=""):
 
 def _source_block(index, doc, clip_limit):
     meta = doc.metadata or {}
-    loc = f"{meta.get('source') or 'document.pdf'} p.{meta.get('page', '?')} {meta.get('type') or 'text'}"
+    source = meta.get("source") or "document.pdf"
+    page = meta.get("page", "?")
+    kind = meta.get("type") or "text"
+    heading = (meta.get("heading") or meta.get("section") or "").strip()
+    loc = f"{source} p.{page} {kind}"
+    if heading:
+        loc = f"{loc} | {heading[:80]}"
     body = _clip(get_answer_context(doc), clip_limit)
     return f"[Source {index} | {loc}]\n{body}"
 
 
+def _token_set(text):
+    return {token.lower() for token in re.findall(r"[a-z0-9]{3,}", text or "", re.I)}
+
+
+def dedupe_near_duplicate_docs(docs, threshold=0.82):
+    """Drop overlapping chunks so repeated text does not dominate the prompt."""
+    unique = []
+    seen_sets = []
+    for doc in docs:
+        tokens = _token_set(get_answer_context(doc) or doc.page_content or "")
+        if len(tokens) >= 8 and any(
+            (len(tokens & other) / (len(tokens | other) or 1)) >= threshold
+            for other in seen_sets
+            if other
+        ):
+            continue
+        unique.append(doc)
+        seen_sets.append(tokens)
+    return unique
+
+
 def pack_context(docs, char_budget):
-    """Fit as many reranked chunks as the leftover window allows."""
+    """Fit reranked chunks into the leftover window.
+
+    Clip as if packing a few long pages so the top hits stay intact; extra
+    chunks only fill leftover budget. Retrieval can still consider up to
+    MAX_PACKED_DOCS candidates (that was the 42.5% generate run).
+    """
+    docs = dedupe_near_duplicate_docs(collapse_to_parents(docs or []))[:MAX_PACKED_DOCS]
     if not docs:
         return "", []
     target = max(TOP_DOCS, 1)
@@ -667,32 +702,10 @@ INTENT_SUMMARIZE_RE = re.compile(
 INTENT_COMPARE_RE = re.compile(
     r"\b(compare|versus|\bvs\.?\b|difference between|differ from|contrast)\b", re.I
 )
-INTENT_EXTRACT_RE = re.compile(
-    r"\b(list all|extract|enumerate|tabulate|all of the)\b", re.I
-)
-INTENT_COMPUTE_RE = re.compile(
-    r"\b(how many years older|how much (older|younger|more|less)|age difference|"
-    r"percentage|percent|how long would|area of|times (as )?(many|much)|"
-    r"compared to|how many more)\b",
-    re.I,
-)
 CLAIM_NUM_RE = re.compile(
     r"\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+\.\d+%?|\d{3,}(?:\.\d+)?%?"
 )
 SOURCE_CITE_RE = re.compile(r"\[(?:Source\s*)?(\d+)\]", re.I)
-
-
-def classify_intent(query):
-    text = query or ""
-    if INTENT_SUMMARIZE_RE.search(text):
-        return "summarize"
-    if INTENT_COMPUTE_RE.search(text):
-        return "compute"
-    if INTENT_COMPARE_RE.search(text):
-        return "compare"
-    if INTENT_EXTRACT_RE.search(text):
-        return "extract"
-    return "lookup"
 
 
 def split_compare_topics(query):
@@ -734,6 +747,32 @@ def collapse_to_parents(docs):
         seen.add(key)
         unique.append(doc)
     return unique
+
+
+def merge_answer_docs(passing, source_docs, limit):
+    """Prefer rerank-passing chunks, then fill from the wider retrieved set."""
+    merged = []
+    seen = set()
+    for doc in list(passing or []) + list(source_docs or []):
+        marker = id(doc)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        merged.append(doc)
+        if len(merged) >= limit:
+            break
+    return merged
+
+
+def context_supports_query(query, packed_text):
+    packed_l = (packed_text or "").lower()
+    if not packed_l:
+        return False
+    keys = _key_terms(query)
+    if not keys:
+        return False
+    hits = sum(1 for key in keys if key.lower() in packed_l)
+    return hits >= max(1, min(2, len(keys)))
 
 
 def write_trace(session, payload):
@@ -873,6 +912,7 @@ def verify_grounding(answer, packed_text, n_sources, intent=None):
         return True, text
     if re.match(r"^\s*invalid question\b", text, re.I):
         return True, text
+    stripped = SOURCE_CITE_RE.sub(" ", text)
     packed_l = (packed_text or "").lower()
     cites = [int(num) for num in SOURCE_CITE_RE.findall(text)]
     if cites and any(num < 1 or num > n_sources for num in cites):
@@ -880,7 +920,7 @@ def verify_grounding(answer, packed_text, n_sources, intent=None):
         return False, "I don't know"
     packed_nums = _parse_source_numbers(packed_text)
     missing_nums = [
-        num for num in CLAIM_NUM_RE.findall(text)
+        num for num in CLAIM_NUM_RE.findall(stripped)
         if not _number_supported(num, packed_l, packed_nums)
     ]
     if missing_nums:
@@ -888,7 +928,7 @@ def verify_grounding(answer, packed_text, n_sources, intent=None):
         return False, "I don't know"
     if intent == "compute":
         return True, text
-    keys = _strict_terms(text)
+    keys = _strict_terms(stripped)
     if keys:
         hit = sum(1 for key in keys if key.lower() in packed_l)
         if hit / len(keys) < 0.5:
@@ -920,80 +960,226 @@ def retrieve_and_rerank(query, session, limit=None):
     }
 
 
+_FEW_SHOT = """
+Format examples (do not copy the facts):
+
+Example A — sources contain the answer. Restate names from the question:
+Sources:
+[Source 1 | bio.pdf p.2 text]
+Khloé Kardashian was born in 1984. Kylie Jenner was born in 1997.
+Question: how many years older is Khloé Kardashian than her youngest sister Kylie?
+<reasoning>
+1. Source 1: Khloé born 1984, Kylie born 1997.
+2. 1997 - 1984 = 13.
+</reasoning>
+<final_answer>Khloé Kardashian is 13 years older than her youngest sister, Kylie Jenner.</final_answer>
+
+Example B — sources are about a different topic:
+Sources:
+[Source 1 | sports.pdf p.1 text]
+The 2023 final was played in Istanbul.
+Question: who was the goalkeeper in that final?
+<reasoning>
+1. Source 1 names only the venue.
+2. The goalkeeper is not written.
+</reasoning>
+<final_answer>I don't know</final_answer>
+"""
+
+
 def _answer_prompt(query, combined_docs, history_section="", intent="lookup"):
     extra = ""
     if intent == "compute":
         extra = (
-            "This question needs a calculation (age gap, difference, percentage, area, or ratio). "
-            "Extract the input numbers from the sources, compute the result, and put that result "
-            "in <final_answer>. If a required input is missing, respond with \"I don't know\".\n"
+            "This is a calculation. Extract the inputs from the sources, compute, and write a "
+            "full sentence that names the people or items from the question plus the number.\n"
         )
     elif intent == "compare":
         extra = (
-            "Compare the two sides using only the sources. State which is higher/lower or the "
-            "difference. If either side is missing, respond with \"I don't know\".\n"
+            "Compare both sides using only the sources. Name both sides and the values. "
+            "If only one side is present, still report that side rather than refusing.\n"
         )
     elif intent == "extract":
-        extra = "List every matching item from the sources. Do not add items that are not written there.\n"
-    return f"""Answer strictly from the numbered sources.
-If the sources do not contain the answer, respond with "I don't know".
-If the question assumes something false (wrong person, title, event, or fact), respond with "invalid question".
+        extra = (
+            "List every matching item written in the sources. Keep going until the sources run out. "
+            "A partial list is better than I don't know.\n"
+        )
+    return f"""You are a grounded document assistant. Use ONLY the numbered sources below.
 
+Rules:
+- If a source mentions the people, titles, numbers, or entities in the question, you MUST answer from that text. Do not say I don't know in that case.
+- Prefer a partial answer over I don't know whenever any relevant span exists.
+- Write a complete sentence that repeats the key names from the question and the value from the sources.
+- Say I don't know only when the sources are about something else entirely.
+- If the question assumes something false, respond with exactly: invalid question
+- If sources disagree, report both values in one sentence.
+- Copy names and numbers as written. Arithmetic is allowed when the inputs are in the sources.
+- Put citations only in <reasoning>, not in <final_answer>.
+- Tables are "Row: Header is value". Do not mix values across rows.
+
+{_FEW_SHOT}
 {history_section}Sources:
 {combined_docs}
 
 Question: {query}
 
-{extra}Tables are written as "Row: Header is value". Do not mix values across rows.
-Do not invent names, dates, or quotes that are not in the sources.
-Computed values (differences, products, percentages) are allowed when the inputs are in the sources.
-Write <reasoning> that only names which source numbers you used and why they are relevant. Do not repeat the answer there.
-Then put a short user-facing answer only inside <final_answer> tags. Prefer the same names and numbers as the sources.
+{extra}Write <reasoning> as short numbered steps (source + span + math). Then put the user-facing sentence inside <final_answer>.
 
 Answer:"""
 
 
-def _generate_answer(query, session, passing, score_map, history_block, extra):
-    char_budget = source_char_budget(query, history_block)
-    combined_docs, top_docs = pack_context(passing[:MAX_PACKED_DOCS], char_budget)
-    citations = _build_citations(top_docs, score_map)
-    history_section = f"{history_block}\n\n" if history_block else ""
-    prompt = _answer_prompt(query, combined_docs, history_section, extra.get("intent") or "lookup")
+def _must_answer_prompt(query, combined_docs):
+    return f"""The sources below are relevant to the question. Answer from them.
+Do not say I don't know. Write one complete sentence that names the question's entities and the value from the sources.
+If several items are listed, include as many as the sources support.
+
+Sources:
+{combined_docs}
+
+Question: {query}
+
+<reasoning>steps</reasoning>
+<final_answer>complete sentence</final_answer>
+"""
+
+
+def _llm_text(prompt, session):
     assembled = ""
     for _piece, assembled in _run_llm(prompt, session):
         if session_cancelled(session):
-            return None, None, citations, extra, None
+            return None
+    return (assembled or "").strip()
+
+
+def _generate_answer(query, session, docs, score_map, history_block, extra):
+    char_budget = source_char_budget(query, history_block)
+    combined_docs, top_docs = pack_context(docs[:MAX_PACKED_DOCS], char_budget)
+    citations = _build_citations(top_docs, score_map)
+    history_section = f"{history_block}\n\n" if history_block else ""
+    intent = extra.get("intent") or "lookup"
+    prompt = _answer_prompt(query, combined_docs, history_section, intent)
+    assembled = _llm_text(prompt, session)
+    if assembled is None:
+        return None, None, citations, extra, None
     display_answer = extract_display_answer(assembled)
+    if (
+        REFUSAL_RE.match(display_answer or "")
+        and combined_docs
+        and context_supports_query(query, combined_docs)
+    ):
+        retry = _llm_text(_must_answer_prompt(query, combined_docs), session)
+        if retry is None:
+            return None, None, citations, extra, None
+        if retry:
+            assembled = retry
+            display_answer = extract_display_answer(assembled)
     grounded, display_answer = verify_grounding(
-        display_answer, combined_docs, len(top_docs), extra.get("intent")
+        display_answer, combined_docs, len(top_docs), intent
     )
     extra = dict(extra)
     extra["grounded"] = grounded
+    extra["retried_answer"] = bool(REFUSAL_RE.match(display_answer or "") is False)
     if not grounded:
         extra["rerank_passed"] = False
     reasoning = "" if not grounded else distinct_reasoning(display_answer, extract_reasoning(assembled))
     return (display_answer, reasoning, citations, extra, top_docs)
 
 
-def ask_question_events(query, session):
+def _chat_events(query, session):
+    """General chat with history only — no retrieval."""
+    yield {
+        "type": "stage",
+        "id": "reasoning",
+        "label": "Responding",
+        "detail": "Chat mode (no document retrieval)",
+    }
+    history_block = _history_block(session.chat_history)
+    history_section = f"Recent conversation:\n{history_block}\n\n" if history_block else ""
+    prompt = (
+        "You are Cloak, a private local assistant running entirely on the user's machine. "
+        "Be helpful, precise, and concise. You are not retrieving documents for this turn — "
+        "answer from general knowledge and the conversation below. "
+        "If the user needs something from their PDFs, ask them to include the file or ask a "
+        "document-specific question.\n\n"
+        f"{history_section}"
+        f"User: {query}\n"
+        "Assistant:"
+    )
+    assembled = ""
+    for _piece, assembled in _run_llm(prompt, session):
+        if session_cancelled(session):
+            yield _stopped()
+            return
+    answer = extract_display_answer(assembled) or (assembled or "").strip() or "I don't know"
+    _remember(session.chat_history, query, answer)
+    write_trace(
+        session,
+        {
+            "event": "chat",
+            "query": query,
+            "route": getattr(session, "last_route", "chat"),
+            "reason": getattr(session, "last_route_reason", ""),
+        },
+    )
+    yield _complete(
+        answer,
+        extra={
+            "route": getattr(session, "last_route", "chat"),
+            "reason": getattr(session, "last_route_reason", ""),
+            "intent": "chat",
+            "rerank_passed": None,
+        },
+    )
+
+
+def ask_question_events(query, session, force_mode="auto"):
     chat_history = session.chat_history
     started = time.time()
+    doc_count = len(
+        {
+            (chunk.metadata or {}).get("content_hash")
+            for chunk in (session.chunks or [])
+            if (chunk.metadata or {}).get("content_hash")
+        }
+    ) or (1 if session.chunks else 0)
 
     def cancelled():
         return session_cancelled(session)
 
-    print(f"Session has {len(session.chunks)} chunks")
-    if not session.chunks or session.hybrid_retriever is None:
-        answer = "I don't know"
-        _remember(chat_history, query, answer)
-        yield _complete(answer)
+    route, reason = decide_route(query, doc_count=doc_count, force_mode=force_mode)
+    session.last_route = route
+    session.last_route_reason = reason
+    print(f"Route={route} reason={reason} docs={doc_count} chunks={len(session.chunks or [])}")
+    yield {
+        "type": "stage",
+        "id": "routing",
+        "label": "Routing",
+        "detail": f"{route_label(route)} ({reason})",
+        "route": route,
+        "reason": reason,
+    }
+
+    if route == "chat":
+        yield from _chat_events(query, session)
         return
 
     if cancelled():
         yield _stopped()
         return
 
-    intent = classify_intent(query)
+    if not session.chunks or session.hybrid_retriever is None:
+        answer = "I don't know"
+        _remember(chat_history, query, answer)
+        yield _complete(answer, extra={"route": route, "reason": reason, "intent": "lookup"})
+        return
+
+    intent = {
+        "rag_summarize": "summarize",
+        "rag_compare": "compare",
+        "rag_compute": "compute",
+        "rag_extract": "extract",
+        "rag_lookup": "lookup",
+    }.get(route, classify_intent(query))
     search_question = rewrite_with_history(query, chat_history)
     yield {
         "type": "stage",
@@ -1013,7 +1199,10 @@ def ask_question_events(query, session):
         yield from _compare_events(query, session, compare_topics)
         return
 
-    keep_n = EXTRACT_TOP_DOCS if intent == "extract" else TOP_DOCS
+    keep_n = max(
+        EXTRACT_TOP_DOCS if intent == "extract" else TOP_DOCS,
+        MAX_PACKED_DOCS,
+    )
     yield {
         "type": "stage",
         "id": "fetching",
@@ -1031,8 +1220,8 @@ def ask_question_events(query, session):
     if not fused_n:
         answer = "I don't know"
         _remember(chat_history, query, answer)
-        write_trace(session, {"event": "empty_retrieval", "query": query, "intent": intent})
-        yield _complete(answer)
+        write_trace(session, {"event": "empty_retrieval", "query": query, "intent": intent, "route": route})
+        yield _complete(answer, extra={"route": route, "reason": reason, "intent": intent})
         return
 
     yield {
@@ -1086,13 +1275,14 @@ def ask_question_events(query, session):
         yield _stopped(citations)
         return
 
-    if not passing:
+    answer_docs = merge_answer_docs(passing, source_docs, MAX_PACKED_DOCS)
+    if not answer_docs:
         answer = "I don't know"
         _remember(chat_history, query, answer)
         write_trace(
             session,
             {
-                "event": "low_confidence",
+                "event": "no_answer_docs",
                 "query": query,
                 "intent": intent,
                 "confidence": top_confidence,
@@ -1100,12 +1290,13 @@ def ask_question_events(query, session):
                 "elapsed": time.time() - started,
             },
         )
-        print(
-            f"Rerank confidence {top_confidence:.3f} < {RERANK_MIN_SCORE:.3f}; "
-            "skipping generation."
-        )
         yield _complete(answer, citations, extra)
         return
+    if not passing:
+        print(
+            f"Rerank confidence {top_confidence:.3f} < {RERANK_MIN_SCORE:.3f}; "
+            "generating from top retrieved docs anyway."
+        )
 
     history_block = _history_block(chat_history)
     yield {
@@ -1115,7 +1306,7 @@ def ask_question_events(query, session):
         "detail": "Writing the answer",
         "citations": citations,
     }
-    generated = _generate_answer(query, session, passing, score_map, history_block, extra)
+    generated = _generate_answer(query, session, answer_docs, score_map, history_block, extra)
     if generated[0] is None:
         yield _stopped(citations)
         return
@@ -1241,7 +1432,9 @@ def _compare_events(query, session, topics):
     score_map = {}
     for topic in topics:
         retrieval = retrieve_and_rerank(topic, session, limit=COMPARE_TOP_PER_SIDE)
-        chosen = retrieval["passing"] or retrieval["source_docs"][:1]
+        chosen = merge_answer_docs(
+            retrieval["passing"], retrieval["source_docs"], COMPARE_TOP_PER_SIDE
+        )
         for doc in chosen:
             combined_docs.append(doc)
             score_map.update(retrieval["score_map"])
@@ -1261,10 +1454,7 @@ def _compare_events(query, session, topics):
         ),
     }
     if not passing:
-        answer = "I don't know"
-        _remember(session.chat_history, query, answer)
-        yield _complete(answer, citations, extra)
-        return
+        print("Compare rerank below threshold; generating from retrieved docs anyway.")
     history_block = _history_block(session.chat_history)
     yield {
         "type": "stage",
@@ -1273,7 +1463,10 @@ def _compare_events(query, session, topics):
         "detail": "Writing the comparison",
         "citations": citations,
     }
-    generated = _generate_answer(query, session, passing, score_map, history_block, extra)
+    generated = _generate_answer(
+        query, session, merge_answer_docs(passing, combined_docs, MAX_PACKED_DOCS),
+        score_map, history_block, extra,
+    )
     if generated[0] is None:
         yield _stopped(citations)
         return
@@ -1290,9 +1483,9 @@ def _compare_events(query, session, topics):
     }
 
 
-def ask_question(query, session):
+def ask_question(query, session, force_mode="auto"):
     result = {"answer": "I don't know", "context": [], "citations": []}
-    for event in ask_question_events(query, session):
+    for event in ask_question_events(query, session, force_mode=force_mode):
         if event.get("type") == "complete":
             result = {
                 "answer": event.get("answer") or "",
@@ -1303,5 +1496,7 @@ def ask_question(query, session):
                 "rerank_min_score": event.get("rerank_min_score"),
                 "rerank_passed": event.get("rerank_passed"),
                 "intent": event.get("intent"),
+                "route": event.get("route"),
+                "reason": event.get("reason"),
             }
     return result

@@ -42,6 +42,7 @@ class QueryRequest(BaseModel):
     query: str
     content_hashes: Optional[list[str]] = None
     model: Optional[str] = None
+    route_mode: Optional[str] = "auto"
 
 
 class UnloadDocumentRequest(BaseModel):
@@ -213,7 +214,8 @@ async def query_rag(
         session.cancel.clear()
         session.sync_included_hashes(request.content_hashes)
         session.llm_model = (request.model or "").strip() or LLM_MODEL
-        return ask_question(request.query, session)
+        force = (request.route_mode or "auto").strip().lower() or "auto"
+        return ask_question(request.query, session, force_mode=force)
 
 
 @app.post("/query/cancel")
@@ -290,7 +292,8 @@ async def query_rag_stream(
             session.cancel.clear()
             session.sync_included_hashes(request.content_hashes)
             session.llm_model = (request.model or "").strip() or LLM_MODEL
-            for event in ask_question_events(request.query, session):
+            force = (request.route_mode or "auto").strip().lower() or "auto"
+            for event in ask_question_events(request.query, session, force_mode=force):
                 yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
