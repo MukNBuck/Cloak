@@ -1,5 +1,6 @@
 # Ignore the Python virtual environment
 rag_env/
+.venv/
 __pycache__/
 
 # Ignore the vector database
