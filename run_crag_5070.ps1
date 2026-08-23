@@ -60,12 +60,12 @@ function Invoke-Crag {
 
 switch ($ModeArg) {
     "smoke" {
-        Invoke-Crag smoke_corpus @("--mode", "corpus", "--limit", "80")
+        Invoke-Crag smoke_corpus @("--mode", "corpus", "--limit", "80", "--html")
         Invoke-Crag smoke_retrieval @("--mode", "retrieval", "--limit", "20", "--html")
     }
     "corpus" {
         $n = if ($Limit) { $Limit } else { 200 }
-        Invoke-Crag corpus @("--mode", "corpus", "--limit", "$n")
+        Invoke-Crag corpus @("--mode", "corpus", "--limit", "$n", "--html")
     }
     "retrieval" {
         $n = if ($Limit) { $Limit } else { 100 }
@@ -76,7 +76,7 @@ switch ($ModeArg) {
         Invoke-Crag generate @("--mode", "generate", "--limit", "$n", "--html")
     }
     "all" {
-        Invoke-Crag corpus @("--mode", "corpus", "--limit", "200")
+        Invoke-Crag corpus @("--mode", "corpus", "--limit", "200", "--html")
         Invoke-Crag retrieval @("--mode", "retrieval", "--limit", "100", "--html")
         Invoke-Crag generate @("--mode", "generate", "--limit", "40", "--html")
     }

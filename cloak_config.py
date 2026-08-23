@@ -200,10 +200,10 @@ def list_ollama_models(force=False):
     return result
 
 
-# Fetch wide so the reranker can promote a buried hit; keep only TOP_DOCS after scoring.
+# Fetch wide so the reranker can promote a buried hit; keep TOP_DOCS after scoring.
 RETRIEVE_K = _int("CLOAK_RETRIEVE_K", 50)
 RERANK_CANDIDATES = _int("CLOAK_RERANK_CANDIDATES", 50)
-TOP_DOCS = _int("CLOAK_TOP_DOCS", 3)
+TOP_DOCS = _int("CLOAK_TOP_DOCS", 5)
 MAX_PACKED_DOCS = _int("CLOAK_MAX_PACKED_DOCS", 8)
 EXTRACT_TOP_DOCS = _int("CLOAK_EXTRACT_TOP_DOCS", 5)
 COMPARE_TOP_PER_SIDE = _int("CLOAK_COMPARE_TOP_PER_SIDE", 2)
@@ -212,17 +212,17 @@ AGENT_RETRIES = _int("CLOAK_AGENT_RETRIES", 1)
 
 # MiniLM/BGE logits mapped through sigmoid. Below this, skip generation
 # unless a retry produces a passing hit.
-RERANK_MIN_SCORE = _float("CLOAK_RERANK_MIN_SCORE", 0.35)
+RERANK_MIN_SCORE = _float("CLOAK_RERANK_MIN_SCORE", 0.20)
 RERANK_MAX_CHARS = _int("CLOAK_RERANK_MAX_CHARS", 1800)
 
 NUM_CTX = _int("CLOAK_NUM_CTX", 16384)
 NUM_PREDICT = _int("CLOAK_NUM_PREDICT", 4096)
 PROMPT_RESERVE_TOKENS = _int("CLOAK_PROMPT_RESERVE_TOKENS", 400)
 # Parent page text sent to the LLM (small-to-big).
-MAX_CHUNK_CHARS = _int("CLOAK_MAX_CHUNK_CHARS", 2800)
-PARENT_TEXT_CHARS = _int("CLOAK_PARENT_TEXT_CHARS", 1500)
+MAX_CHUNK_CHARS = _int("CLOAK_MAX_CHUNK_CHARS", 4000)
+PARENT_TEXT_CHARS = _int("CLOAK_PARENT_TEXT_CHARS", 3200)
 # 0 = fill leftover window automatically. Set a positive cap to override.
-MAX_CONTEXT_CHARS = _int("CLOAK_MAX_CONTEXT_CHARS", 10000)
+MAX_CONTEXT_CHARS = _int("CLOAK_MAX_CONTEXT_CHARS", 16000)
 HISTORY_MESSAGES = _int("CLOAK_HISTORY_MESSAGES", 8)
 CHARS_PER_TOKEN = 3.5
 
