@@ -123,6 +123,7 @@ def tokens(text):
 
 ABSTAIN_GOLD = {
     "invalid question",
+    "not enough information",
     "i don't know",
     "i do not know",
     "unknown",
@@ -364,7 +365,13 @@ def score_record(record, mode="retrieval"):
             row["pred"] = pred
             gen_hit, _ = gold_in_text(golds, pred)
             if abstain:
-                gen_hit = bool(re.match(r"^\s*(i\s+don'?t\s+know|invalid)\b", pred, re.I))
+                gen_hit = bool(
+                    re.match(
+                        r"^\s*(i\s+don'?t\s+know|i\s+do\s+not\s+know|invalid question|not enough information|unknown|n/?a)\b",
+                        pred,
+                        re.I,
+                    )
+                )
             elif normalize(golds[0]) and normalize(golds[0]) in normalize(pred):
                 gen_hit = True
             row["generate_hit"] = gen_hit

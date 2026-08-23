@@ -910,7 +910,7 @@ def verify_grounding(answer, packed_text, n_sources, intent=None):
     text = (answer or "").strip()
     if not text or REFUSAL_RE.match(text):
         return True, text
-    if re.match(r"^\s*invalid question\b", text, re.I):
+    if re.match(r"^\s*(invalid question|not enough information)\b", text, re.I):
         return True, text
     stripped = SOURCE_CITE_RE.sub(" ", text)
     packed_l = (packed_text or "").lower()
@@ -984,6 +984,17 @@ Question: who was the goalkeeper in that final?
 2. The goalkeeper is not written.
 </reasoning>
 <final_answer>I don't know</final_answer>
+
+Example C — false premise or facts not in the sources:
+Sources:
+[Source 1 | bio.pdf p.1 text]
+Khloé Kardashian was born in 1984.
+Question: in what year did Khloé Kardashian win an Olympic gold medal?
+<reasoning>
+1. Source 1 states a birth year only.
+2. The question assumes an Olympic gold that is not in the sources.
+</reasoning>
+<final_answer>invalid question</final_answer>
 """
 
 
@@ -1011,7 +1022,7 @@ Rules:
 - Prefer a partial answer over I don't know whenever any relevant span exists.
 - Write a complete sentence that repeats the key names from the question and the value from the sources.
 - Say I don't know only when the sources are about something else entirely.
-- If the question assumes something false, respond with exactly: invalid question
+- If a question contains a false premise, relies on facts not present in the text, or cannot be answered using the context, you must output exact phrases like 'invalid question' or 'not enough information' rather than guessing.
 - If sources disagree, report both values in one sentence.
 - Copy names and numbers as written. Arithmetic is allowed when the inputs are in the sources.
 - Put citations only in <reasoning>, not in <final_answer>.
@@ -1032,6 +1043,7 @@ def _must_answer_prompt(query, combined_docs):
     return f"""The sources below are relevant to the question. Answer from them.
 Do not say I don't know. Write one complete sentence that names the question's entities and the value from the sources.
 If several items are listed, include as many as the sources support.
+If a question contains a false premise, relies on facts not present in the text, or cannot be answered using the context, you must output exact phrases like 'invalid question' or 'not enough information' rather than guessing.
 
 Sources:
 {combined_docs}
