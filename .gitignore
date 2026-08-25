@@ -1,13 +1,32 @@
-# Ignore the Python virtual environment
+# Python
+.venv/
 rag_env/
 __pycache__/
+*.pyc
+*.pyo
 
-# Ignore the vector database
+# Secrets & local config
+.env
+
+# Vector DB and runtime caches
 db/
-
-# Ignore your uploaded documents and extracted images
-docs/
 extracted_images/
 
-# Ignore environment variables
-.env
+# Sample PDFs and embedding packs (keep folder, ignore large files)
+samples/*.pdf
+samples/*.json
+samples/*.cloak.json
+
+# CRAG benchmark outputs (keep helper scripts under crag_results/)
+crag_results/*.json
+crag_results/_*.json
+
+# Desktop (Electron)
+node_modules/
+desktop/node_modules/
+
+# PyInstaller / build output
+build/
+dist/
+legacy/build/
+legacy/dist/

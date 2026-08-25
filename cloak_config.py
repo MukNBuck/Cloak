@@ -108,7 +108,7 @@ def _float(name, default):
 
 
 # Dedicated instruct model for answers. Vision stays on a separate model.
-LLM_MODEL = os.getenv("CLOAK_LLM_MODEL", "qwen3:8b")
+LLM_MODEL = os.getenv("CLOAK_LLM_MODEL", "qwen2.5:7b")
 VISION_MODEL = os.getenv("CLOAK_VISION_MODEL", "qwen2.5vl:7b")
 OLLAMA_BASE_URL = os.getenv("OLLAMA_HOST", os.getenv("CLOAK_OLLAMA_URL", "http://127.0.0.1:11434")).rstrip("/")
 ENABLE_VISION = _flag("CLOAK_VISION", "1")
@@ -227,7 +227,7 @@ MAX_CHUNK_CHARS = _int("CLOAK_MAX_CHUNK_CHARS", 2800)
 PARENT_TEXT_CHARS = _int("CLOAK_PARENT_TEXT_CHARS", 2400)
 # 0 = fill leftover window automatically. Set a positive cap to override.
 MAX_CONTEXT_CHARS = _int("CLOAK_MAX_CONTEXT_CHARS", 16000)
-HISTORY_MESSAGES = _int("CLOAK_HISTORY_MESSAGES", 8)
+HISTORY_MESSAGES = _int("CLOAK_HISTORY_MESSAGES", 24)
 CHARS_PER_TOKEN = 3.5
 
 # auto = try hi_res, then ocr_only, then fast.

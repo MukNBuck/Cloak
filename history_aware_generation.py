@@ -40,10 +40,21 @@ from cloak_config import (
     torch_device,
 )
 from langchain_core.documents import Document
-from langchain_core.messages import HumanMessage, AIMessage
+from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 from langchain_ollama import ChatOllama
 
 from route import classify_intent, decide_route, route_label
+from harness import strip_chat, thread_messages, try_direct_clock, try_direct_math
+from chat_tools import (
+    CHAT_TOOLS,
+    MAX_TOOL_CHARS,
+    MAX_TOOL_ROUNDS,
+    TOOL_NUM_PREDICT,
+    attached_pdf_names,
+    execute_tool,
+    normalize_tool_calls,
+    stage_for_calls,
+)
 
 _DEVICE = torch_device()
 _llm_lock = threading.Lock()
@@ -57,19 +68,25 @@ def _safe_print(text):
         print(str(text).encode("ascii", "replace").decode("ascii"))
 
 
-def get_llm(model_name=None):
+def get_llm(model_name=None, temperature=0.0, *, chat=False):
     name = (model_name or LLM_MODEL).strip() or LLM_MODEL
+    key = (name, round(float(temperature), 2), bool(chat))
     with _llm_lock:
-        client = _llm_cache.get(name)
+        client = _llm_cache.get(key)
         if client is None:
-            client = ChatOllama(
-                model=name,
-                temperature=0.0,
-                num_ctx=NUM_CTX,
-                num_predict=NUM_PREDICT,
-                reasoning=False,
-            )
-            _llm_cache[name] = client
+            kwargs = {
+                "model": name,
+                "temperature": float(temperature),
+                "num_ctx": NUM_CTX,
+                "num_predict": NUM_PREDICT,
+                "reasoning": False,
+                "keep_alive": "30m",
+            }
+            if chat:
+                # Qwen2.5-Instruct recommended sampling. RAG stays greedy.
+                kwargs.update(top_p=0.8, top_k=20, repeat_penalty=1.05)
+            client = ChatOllama(**kwargs)
+            _llm_cache[key] = client
         return client
 
 
@@ -736,10 +753,10 @@ def _rerank_scores(search_question, rerank_docs):
         return [float(len(rerank_docs) - index) for index in range(len(rerank_docs))]
 
 
-def _run_llm(prompt, session=None):
+def _run_llm(prompt, session=None, temperature=0.0, chat=False):
     assembled = []
     model_name = getattr(session, "llm_model", None) if session is not None else None
-    client = get_llm(model_name)
+    client = get_llm(model_name, temperature=temperature, chat=chat)
     try:
         for chunk in client.stream(prompt):
             if session_cancelled(session):
@@ -1552,33 +1569,140 @@ def _generate_answer(query, session, docs, score_map, history_block, extra):
     return (display_answer, reasoning, citations, extra, top_docs)
 
 
+def load_thread_history(session, messages):
+    """Restore a saved chat into the live session so follow-ups keep context."""
+    session.chat_history = []
+    for item in messages or []:
+        content = (item.get("content") or "").strip()
+        if not content:
+            continue
+        role = item.get("role") or ""
+        if role == "user":
+            session.chat_history.append(HumanMessage(content=content))
+        elif role == "assistant":
+            session.chat_history.append(AIMessage(content=content))
+    _trim_history(session.chat_history)
+
+
 def _chat_events(query, session):
-    """General chat with history only — no retrieval."""
+    """General assistant harness — native chat template, streamed tokens, tools."""
+    direct = try_direct_math(query)
+    reason = "direct_math"
+    if not direct:
+        direct = try_direct_clock(query)
+        reason = "direct_clock"
+    if direct:
+        _remember(session.chat_history, query, direct)
+        yield _complete(
+            direct,
+            extra={
+                "route": "chat",
+                "reason": reason,
+                "intent": "chat",
+                "rerank_passed": None,
+            },
+        )
+        return
     yield {
         "type": "stage",
         "id": "reasoning",
-        "label": "Responding",
-        "detail": "Chat mode (no document retrieval)",
+        "label": "Thinking",
+        "detail": "Thinking…",
     }
-    history_block = _history_block(session.chat_history)
-    history_section = f"Recent conversation:\n{history_block}\n\n" if history_block else ""
-    prompt = (
-        "You are Cloak, a private local assistant running entirely on the user's machine. "
-        "Be helpful, precise, and concise. You are not retrieving documents for this turn — "
-        "answer from general knowledge and the conversation below. "
-        "If the user needs something from their PDFs, ask them to include the file or ask a "
-        "document-specific question.\n\n"
-        f"{history_section}"
-        f"User: {query}\n"
-        "Assistant:"
+    pdf_names = attached_pdf_names(session)
+    messages = thread_messages(
+        session.chat_history,
+        query,
+        limit=HISTORY_MESSAGES,
+        pdf_names=pdf_names,
     )
-    assembled = ""
-    for _piece, assembled in _run_llm(prompt, session):
-        if session_cancelled(session):
-            yield _stopped()
-            return
-    answer = extract_display_answer(assembled) or (assembled or "").strip() or "I don't know"
+    used_tools = []
+    hit_docs = []
+    answer = None
+    model_name = getattr(session, "llm_model", None)
+    try:
+        tool_llm = get_llm(model_name, temperature=0.15, chat=True).bind_tools(
+            CHAT_TOOLS,
+            num_predict=TOOL_NUM_PREDICT,
+        )
+    except Exception as exc:
+        print(f"Chat tools unavailable ({exc}); answering without them.")
+        tool_llm = None
+
+    if tool_llm is not None:
+        for _round in range(MAX_TOOL_ROUNDS):
+            if session_cancelled(session):
+                yield _stopped()
+                return
+            try:
+                response = tool_llm.invoke(messages)
+            except Exception as exc:
+                print(f"Tool-calling round failed ({exc}); answering without more tools.")
+                break
+            calls = normalize_tool_calls(response)
+            if not calls:
+                visible = strip_chat(getattr(response, "content", None) or "")
+                if visible:
+                    yield {"type": "token", "text": visible, "answer": visible}
+                    answer = visible
+                break
+            try:
+                response.tool_calls = [
+                    {
+                        "name": call["name"],
+                        "args": call["args"],
+                        "id": call["id"],
+                        "type": "tool_call",
+                    }
+                    for call in calls
+                ]
+            except Exception:
+                pass
+            messages.append(response)
+            yield {
+                "type": "stage",
+                "id": "tools",
+                "label": "Using tools",
+                "detail": stage_for_calls(calls),
+            }
+            for call in calls:
+                if session_cancelled(session):
+                    yield _stopped()
+                    return
+                name = call.get("name") or ""
+                used_tools.append(name)
+                result, docs = execute_tool(name, call.get("args"), session)
+                if docs:
+                    hit_docs.extend(docs)
+                _safe_print(f"Tool {name} -> {str(result)[:180]!r}")
+                messages.append(
+                    ToolMessage(
+                        content=str(result)[:MAX_TOOL_CHARS],
+                        tool_call_id=call.get("id") or name,
+                    )
+                )
+        else:
+            print("Chat tool round limit reached; writing a final answer.")
+
+    if answer is None:
+        yield {
+            "type": "stage",
+            "id": "reasoning",
+            "label": "Thinking",
+            "detail": "Thinking…",
+        }
+        assembled = ""
+        for piece, assembled in _run_llm(messages, session, temperature=0.7, chat=True):
+            if session_cancelled(session):
+                yield _stopped()
+                return
+            visible = strip_chat(assembled)
+            if visible:
+                yield {"type": "token", "text": piece, "answer": visible}
+        answer = strip_chat(assembled) or (assembled or "").strip() or "I don't know"
+
     _remember(session.chat_history, query, answer)
+    citations = _build_citations(_dedupe_tool_docs(hit_docs)[:6]) if hit_docs else []
     write_trace(
         session,
         {
@@ -1586,17 +1710,33 @@ def _chat_events(query, session):
             "query": query,
             "route": getattr(session, "last_route", "chat"),
             "reason": getattr(session, "last_route_reason", ""),
+            "tools": used_tools,
         },
     )
     yield _complete(
         answer,
+        citations,
         extra={
             "route": getattr(session, "last_route", "chat"),
             "reason": getattr(session, "last_route_reason", ""),
             "intent": "chat",
             "rerank_passed": None,
+            "tools": used_tools,
         },
     )
+
+
+def _dedupe_tool_docs(docs):
+    seen = set()
+    unique = []
+    for doc in docs or []:
+        meta = getattr(doc, "metadata", None) or {}
+        key = (meta.get("content_hash"), meta.get("page"), meta.get("source"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(doc)
+    return unique
 
 
 def ask_question_events(query, session, force_mode="auto"):
@@ -1620,8 +1760,8 @@ def ask_question_events(query, session, force_mode="auto"):
     yield {
         "type": "stage",
         "id": "routing",
-        "label": "Routing",
-        "detail": f"{route_label(route)} ({reason})",
+        "label": "Thinking" if route == "chat" else "Routing",
+        "detail": "Thinking…" if route == "chat" else f"{route_label(route)} ({reason})",
         "route": route,
         "reason": reason,
     }

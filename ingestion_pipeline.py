@@ -3,9 +3,11 @@ import math
 import json
 import base64
 import re
+import sys
 from collections import defaultdict
 from functools import lru_cache
 from html.parser import HTMLParser
+from types import SimpleNamespace
 
 from cloak_config import (
     CHILD_CHUNK_OVERLAP,
@@ -174,15 +176,45 @@ def _pdf_strategies():
     return ["hi_res", "ocr_only", "fast"]
 
 
-def _partition_pdf(file_path, output_image_dir):
-    """Layout-aware parse with OCR fallback. Never fail the import on a missing model."""
+class NarrativeText:
+    """Minimal page element so pdfplumber output fits the unstructured ingest path."""
+
+    def __init__(self, text, page):
+        self.text = text
+        self.metadata = SimpleNamespace(page_number=page)
+
+
+def _partition_pdfplumber(file_path):
     try:
-        from unstructured.partition.pdf import partition_pdf
+        import pdfplumber
     except ImportError as exc:
         raise ImportError(
-            "PDF ingest needs the unstructured package. "
-            "Install with: py -3 -m pip install \"unstructured[pdf]\" pdfplumber"
+            "PDF ingest needs pdfplumber in the same Python that runs the server: "
+            f"{sys.executable}. Install with: \"{sys.executable}\" -m pip install pdfplumber"
         ) from exc
+    elements = []
+    with pdfplumber.open(file_path) as pdf:
+        for page_number, page in enumerate(pdf.pages, 1):
+            text = (page.extract_text() or "").strip()
+            if text:
+                elements.append(NarrativeText(text, page_number))
+    print(
+        f"pdfplumber extracted text from {len(elements)} pages in "
+        f"{os.path.basename(file_path)}."
+    )
+    return elements
+
+
+def _partition_pdf(file_path, output_image_dir):
+    """Layout-aware parse with OCR fallback, then pdfplumber if unstructured is missing."""
+    partition_pdf = None
+    try:
+        from unstructured.partition.pdf import partition_pdf as _partition
+        partition_pdf = _partition
+    except Exception as exc:
+        print(f"unstructured PDF import failed ({type(exc).__name__}: {exc}); using pdfplumber.")
+        return _partition_pdfplumber(file_path)
+
     last_error = None
     for strategy in _pdf_strategies():
         kwargs = dict(
@@ -203,13 +235,15 @@ def _partition_pdf(file_path, output_image_dir):
             else:
                 elements = partition_pdf(**kwargs)
             print(f"PDF strategy={strategy} produced {len(elements or [])} elements.")
-            return elements or []
+            if elements:
+                return elements
         except Exception as exc:
             last_error = exc
             print(f"PDF strategy={strategy} failed ({exc}); trying next.")
     if last_error:
-        print(f"All PDF strategies failed; last error: {last_error}")
-    return []
+        print(f"All unstructured PDF strategies failed; last error: {last_error}")
+    print("Falling back to pdfplumber for page text.")
+    return _partition_pdfplumber(file_path)
 
 
 class _HTMLTableParser(HTMLParser):

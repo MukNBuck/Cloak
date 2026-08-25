@@ -19,6 +19,7 @@ sentence-transformers
 transformers
 rank-bm25
 fastapi
+python-multipart
 uvicorn
 pydantic
 pillow

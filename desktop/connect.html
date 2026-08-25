@@ -1,0 +1,74 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Cloak</title>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body {
+      background: #0e0e0e;
+      color: #e3e3e3;
+      font-family: "Segoe UI", Roboto, Arial, sans-serif;
+      display: grid;
+      place-items: center;
+    }
+    .drag {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      height: env(titlebar-area-height, 36px);
+      -webkit-app-region: drag;
+    }
+    .card { width: min(440px, calc(100% - 32px)); text-align: center; }
+    .logo { width: 56px; height: 56px; margin: 0 auto 12px; display: block; }
+    h1 { font-weight: 500; font-size: 28px; margin: 0 0 8px; }
+    p { color: #9aa0a6; margin: 0 0 18px; }
+    label { display: block; font-size: 12px; color: #9aa0a6; }
+    input {
+      width: 100%;
+      margin-top: 6px;
+      background: #1e1f20;
+      border: 1px solid #3c4043;
+      color: #e3e3e3;
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 15px;
+      box-sizing: border-box;
+    }
+    button {
+      margin-top: 16px;
+      width: 100%;
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      background: #8ab4f8;
+      color: #0b1a33;
+      font-weight: 600;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body>
+  <div class="drag"></div>
+  <form class="card" id="form">
+    <img class="logo" src="icon.png" alt="Cloak" />
+    <h1>Connect to Cloak</h1>
+    <p>The desktop app opens the UI from your FastAPI server. Start the backend, then paste its URL.</p>
+    <label>
+      Server URL
+      <input id="server" spellcheck="false" />
+    </label>
+    <button type="submit">Open Cloak</button>
+  </form>
+  <script>
+    const params = new URLSearchParams(location.search);
+    document.getElementById("server").value = params.get("server") || "http://127.0.0.1:8001";
+    document.getElementById("form").addEventListener("submit", (event) => {
+      event.preventDefault();
+      const url = document.getElementById("server").value.trim();
+      if (window.cloakDesktop) window.cloakDesktop.setServer(url);
+    });
+  </script>
+</body>
+</html>

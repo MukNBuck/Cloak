@@ -1,0 +1,26 @@
+{
+  "name": "cloak-desktop",
+  "version": "1.0.0",
+  "description": "Cloak desktop client",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --win nsis"
+  },
+  "author": "Cloak",
+  "license": "UNLICENSED",
+  "devDependencies": {
+    "electron": "^33.4.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "local.cloak.desktop",
+    "productName": "Cloak",
+    "directories": {
+      "output": "dist"
+    },
+    "win": {
+      "target": "nsis"
+    }
+  }
+}

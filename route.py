@@ -30,7 +30,9 @@ NEEDS_EVIDENCE_RE = re.compile(
     r"what does .{1,40} say|"
     r"find (the |where )|"
     r"where (is|does|in)|"
-    r"page \d+"
+    r"page \d+|"
+    r"this (pdf|document|doc|file|contract)|"
+    r"attached (pdf|document|file)"
     r")\b",
     re.I,
 )
@@ -141,17 +143,15 @@ def decide_route(
         return "chat", "chitchat"
 
     intent = classify_intent(text)
-    if intent in {"summarize", "compare", "compute", "extract"}:
-        return _rag_route_for_intent(intent), f"intent:{intent}"
+    if needs_evidence(text):
+        return _rag_route_for_intent(intent), "needs_evidence"
+    if intent == "summarize" and re.search(
+        r"\b(pdf|docs?|document|file|contract|pages?)\b", text, re.I
+    ):
+        return "rag_summarize", "summarize_docs"
 
-    if needs_evidence(text) or looks_factual(text):
-        return "rag_lookup", "factual_with_docs"
-
-    # Short ambiguous messages with docs loaded: prefer chat so RAG isn't forced.
-    if len(text) < 48 and not needs_evidence(text):
-        return "chat", "short_ambiguous"
-
-    return "rag_lookup", "docs_default"
+    # ChatGPT-class default: general questions stay in the assistant harness.
+    return "chat", "assistant_default"
 
 
 def _rag_route_for_intent(intent: str) -> str:
